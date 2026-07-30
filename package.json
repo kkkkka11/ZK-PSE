@@ -1,0 +1,17 @@
+{
+  "name": "zk-pse",
+  "version": "1.0.0",
+  "repository": "https://github.com/kkkkka11/ZK-PSE.git",
+  "author": "kkkkka11",
+  "license": "MIT",
+  "dependencies": {
+    "@zk-email/zk-regex-circom": "^2.3.2",
+    "circomlib": "^2.0.5"
+  },
+  "scripts": {
+    "check": "cargo check --workspace",
+    "build:prover": "cargo build --release --example regex --features parallel && cargo build --release --bin aggregation_server",
+    "generate:circuits": "node regex/build_lookahead_circuits.js regex/password_policies_5.txt fixtures/password_policies_5_ascii --compile --shared-input true --dot ascii",
+    "generate:circuits:noshare": "node regex/build_lookahead_circuits.js regex/password_policies_5.txt fixtures/password_policies_5_ascii_noshare --compile --shared-input false --gen-substrs --dot ascii"
+  }
+}

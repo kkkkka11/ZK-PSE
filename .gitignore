@@ -1,0 +1,34 @@
+# Rust build output
+/target/
+**/target/
+
+# JavaScript dependencies
+node_modules/
+**/node_modules/
+
+# Generated circuit/proof artifacts
+fixtures/password_policies_5_ascii/
+fixtures/password_policies_5_ascii_noshare/
+proof_data/
+proof_data_*/
+**/build/
+*.r1cs
+*.sym
+*.zkey
+*.ptau
+*.wasm
+
+# Logs and benchmark outputs
+logs/
+logs_*/
+*.log
+results/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local assistant/workspace metadata
+.agents/
+.codex/
