@@ -1,15 +1,22 @@
 # ZK-PSE
 
-Zero-knowledge password-policy proving and proof aggregation.
+ZK-PSE is a zero-knowledge password-policy experiment. It converts password
+policies written as regular expressions into Circom circuits, proves private
+password witnesses with Groth16, and aggregates multiple proofs with SnarkPack.
+
+The password itself stays private. The circuit checks the regex policy over
+private password bytes and binds the password to a Poseidon hash output.
+
+> Research prototype. Not audited for production use.
 
 ## Requirements
 
-- Rust
+- Rust toolchain from `rust-toolchain.toml`
 - Node.js and npm
 - `circom`
-- `zk-regex` with `decomposed --shared-input true`
+- A `zk-regex` compiler that supports `decomposed --shared-input true`
 
-If `zk-regex` is not in `regex/target/release/zk-regex`, set:
+The generator first checks `regex/target/release/zk-regex`. Otherwise set:
 
 ```bash
 export ZK_REGEX_BIN=/path/to/zk-regex
@@ -23,6 +30,10 @@ cargo check --workspace
 ```
 
 ## Generate Circuits
+
+Policies are defined in `regex/password_policies_5.txt`. The circuit generator
+splits a policy into regex lookahead checks and wraps them with a Poseidon hash
+binding over the private password bytes.
 
 Shared-input optimized circuits:
 
@@ -47,6 +58,10 @@ node build_lookahead_circuits.js password_policies_5.txt ../fixtures/password_po
 cd ..
 ```
 
+The shared-input version lets all regex subcircuits reuse one private byte
+array. The no-share baseline keeps the original per-subcircuit input handling
+and is useful for comparison.
+
 ## Build
 
 ```bash
@@ -55,6 +70,9 @@ cargo build --release --bin aggregation_server
 ```
 
 ## Run One Experiment
+
+The checked-in scripts run Regex 1 with either good or bad witnesses. Set
+`SKIP_AGGREGATION=1` when you only want proof generation.
 
 Proof only:
 
@@ -81,6 +99,8 @@ N_PARAM=16 L_PARAM=2 T_PARAM=2 RAYON_NUM_THREADS=1 \
 ```
 
 ## Smoke Test
+
+Use this for a quick local sanity check before a longer run.
 
 ```bash
 node regex/build_lookahead_circuits.js regex/smoke_policy.txt fixtures/password_policies_5_ascii \
