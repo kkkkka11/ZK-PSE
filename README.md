@@ -1,8 +1,8 @@
 # ZK-PSE
 
-ZK-PSE is a privacy-preserving password policy evaluation framework based on zero-knowledge proofs. It uses **zk-regex** to compile password policies expressed as regular expressions into **Circom** circuits, employs **Groth16** for zero-knowledge proof generation, and adopts the MPC-based proving techniques from **zk-SaaS** to support outsourced and distributed proof generation.
+ZK-PSE is a privacy-preserving framework for zero-knowledge password policy evaluation. It enables a user to prove that a private password satisfies a public password policy without revealing the password itself.
 
-To efficiently verify a large number of password-policy evaluation results, ZK-PSE further integrates **SnarkPack** for proof aggregation. **Poseidon hash commitments** are used to bind each proof to the corresponding private password, allowing validators to verify policy compliance without learning the password itself.
+ZK-PSE combines several zero-knowledge and secure computation techniques. Password policies expressed as regular expressions are compiled into Circom circuits based on zk-regex. The resulting circuits use Groth16 to generate zero-knowledge proofs, while Poseidon hash commitments bind proofs to the corresponding private passwords. To reduce the computation required on resource-constrained clients, ZK-PSE incorporates MPC-based distributed proving adapted from zk-SaaS. Multiple Groth16 proofs can further be aggregated using SnarkPack for efficient batch verification.
 
 > Research prototype. Not audited for production use.
 
