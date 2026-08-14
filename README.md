@@ -112,6 +112,23 @@ cargo build --release --bin aggregation_server
 NUM_TASKS=2 AGGREGATION_REPEATS=1 SKIP_BUILD=1 ./scripts/regex_1_good.zsh
 ```
 
+## Acknowledgements
+
+ZK-PSE builds on several open-source projects:
+
+* [zk-regex](https://github.com/zkemail/zk-regex) provides the basis for compiling regular expressions into Circom circuits. The regex circuit-generation components included in this repository are adapted and modified from zk-regex to support the shared-input optimization used by ZK-PSE.
+* [zk-SaaS](https://github.com/tangle-network/zk-SaaS) provides components that we adapt for MPC-based distributed Groth16 proof generation.
+* [snarkpack](https://github.com/nikkolasg/snarkpack) provides components that we adapt for proof aggregation and batch verification.
+
+We thank the authors and contributors of these projects for making their implementations publicly available.
+
 ## License
 
-MIT
+The original ZK-PSE implementation is released under the MIT License.
+
+Portions of the regex circuit-generation code are derived from
+[zk-regex](https://github.com/zkemail/zk-regex) and remain subject to the
+GNU General Public License v3.0 (GPL-3.0).
+
+Other third-party components remain subject to their respective licenses.
+Please refer to the corresponding source files and upstream repositories for details.
