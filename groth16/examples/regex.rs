@@ -61,18 +61,20 @@ impl Witness {
         msg_array
     }
     
-    // 将k转换为整数值
-    pub fn k_to_int(&self) -> i64 {
-        // 计算k字符串的简单哈希值
-        let k_bytes = self.k.as_bytes();
-        let mut hash: i64 = 0;
-        
-        for (i, &byte) in k_bytes.iter().enumerate() {
-            if i >= 8 { break; } // 只使用前8个字节
-            hash = hash.wrapping_mul(256).wrapping_add(byte as i64);
+    // 将40个hex字符的salt严格解码为20字节，避免截断或只绑定部分salt。
+    pub fn salt_to_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let salt = self.k.trim();
+        if salt.len() != 40 {
+            return Err(format!("salt k must be exactly 40 hex characters (20 bytes), got {}", salt.len()).into());
         }
-        
-        hash
+
+        let mut out = Vec::with_capacity(20);
+        for i in (0..salt.len()).step_by(2) {
+            let byte = u8::from_str_radix(&salt[i..i + 2], 16)
+                .map_err(|_| format!("salt k contains non-hex characters at positions {}..{}", i, i + 2))?;
+            out.push(byte);
+        }
+        Ok(out)
     }
     
     // 从文件读取witness
@@ -81,6 +83,26 @@ impl Witness {
         let witness: Witness = serde_json::from_str(&content)?;
         Ok(witness)
     }
+}
+
+fn process_peak_rss_bytes() -> u64 {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| status.lines().find(|line| line.starts_with("VmHWM:")).map(str::to_owned))
+        .and_then(|line| line.split_whitespace().nth(1).and_then(|value| value.parse::<u64>().ok()))
+        .map(|kib| kib * 1024)
+        .unwrap_or(0)
+}
+
+fn save_mpc_party_communication(task_id: usize, stats: &mpc_net::multi::MpcCommunicationStats) {
+    let _ = fs::create_dir_all("logs/metrics");
+    let path = format!("logs/metrics/task_{}_mpc_party_communication.csv", task_id);
+    let mut csv = String::from("party_id,sent_payload_bytes,received_payload_bytes\n");
+    for party_id in 0..stats.per_party_sent_payload_bytes.len() {
+        let received = stats.per_party_received_payload_bytes.get(party_id).copied().unwrap_or(0);
+        csv.push_str(&format!("{},{},{}\n", party_id, stats.per_party_sent_payload_bytes[party_id], received));
+    }
+    let _ = fs::write(path, csv);
 }
 
 // 序列化结构体
@@ -164,6 +186,9 @@ struct PerformanceCollector {
     // 客户端工作时间（保留）
     witness_generation_time_ms: f64,
     witness_secret_sharing_time_ms: f64,
+    client_share_serialization_time_ms: f64,
+    client_to_server_total_payload_bytes: u64,
+    client_to_server_max_share_payload_bytes: u64,
     
     // MPC时间（取最慢的那一方）
     mpc_preprocessing_time_ms: f64,
@@ -175,11 +200,18 @@ struct PerformanceCollector {
     mpc_b_g2_computation_ms: f64,
     mpc_c_computation_ms: f64,
     mpc_reconstruction_time_ms: f64,
+    mpc_server_to_server_total_payload_bytes: u64,
+    mpc_server_to_server_max_sent_payload_bytes: u64,
+    mpc_server_to_server_max_received_payload_bytes: u64,
     
     // 其他指标
     circuit_building_time_ms: f64,
     serialization_time_ms: f64,
     verification_time_ms: f64,
+    public_inputs_payload_bytes: u64,
+    server_to_aggregator_cryptographic_payload_bytes: u64,
+    server_to_aggregator_json_artifact_bytes: u64,
+    process_peak_rss_bytes: u64,
 }
 
 impl PerformanceCollector {
@@ -189,6 +221,9 @@ impl PerformanceCollector {
             start_time: Instant::now(),
             witness_generation_time_ms: 0.0,
             witness_secret_sharing_time_ms: 0.0,
+            client_share_serialization_time_ms: 0.0,
+            client_to_server_total_payload_bytes: 0,
+            client_to_server_max_share_payload_bytes: 0,
             mpc_preprocessing_time_ms: 0.0,
             mpc_r1cs_to_qap_ms: 0.0,
             mpc_total_time_ms: 0.0,
@@ -198,9 +233,16 @@ impl PerformanceCollector {
             mpc_b_g2_computation_ms: 0.0,
             mpc_c_computation_ms: 0.0,
             mpc_reconstruction_time_ms: 0.0,
+            mpc_server_to_server_total_payload_bytes: 0,
+            mpc_server_to_server_max_sent_payload_bytes: 0,
+            mpc_server_to_server_max_received_payload_bytes: 0,
             circuit_building_time_ms: 0.0,
             serialization_time_ms: 0.0,
             verification_time_ms: 0.0,
+            public_inputs_payload_bytes: 0,
+            server_to_aggregator_cryptographic_payload_bytes: 0,
+            server_to_aggregator_json_artifact_bytes: 0,
+            process_peak_rss_bytes: 0,
         }
     }
 
@@ -213,6 +255,28 @@ impl PerformanceCollector {
         self.witness_secret_sharing_time_ms = duration_ms;
     }
     
+    fn record_client_share_transport(&mut self, duration_ms: f64, per_server_payload_bytes: &[u64]) {
+        self.client_share_serialization_time_ms = duration_ms;
+        self.client_to_server_total_payload_bytes = per_server_payload_bytes.iter().sum();
+        self.client_to_server_max_share_payload_bytes = per_server_payload_bytes.iter().copied().max().unwrap_or(0);
+    }
+
+    fn record_mpc_communication(&mut self, stats: &mpc_net::multi::MpcCommunicationStats) {
+        self.mpc_server_to_server_total_payload_bytes = stats.total_sent_payload_bytes;
+        self.mpc_server_to_server_max_sent_payload_bytes = stats.max_party_sent_payload_bytes;
+        self.mpc_server_to_server_max_received_payload_bytes = stats.max_party_received_payload_bytes;
+    }
+
+    fn record_proof_transport(&mut self, public_inputs_payload_bytes: u64, cryptographic_payload_bytes: u64, json_artifact_bytes: u64) {
+        self.public_inputs_payload_bytes = public_inputs_payload_bytes;
+        self.server_to_aggregator_cryptographic_payload_bytes = cryptographic_payload_bytes;
+        self.server_to_aggregator_json_artifact_bytes = json_artifact_bytes;
+    }
+
+    fn record_process_peak_rss(&mut self) {
+        self.process_peak_rss_bytes = process_peak_rss_bytes();
+    }
+
     fn record_circuit_building(&mut self, duration_ms: f64) {
         self.circuit_building_time_ms = duration_ms;
     }
@@ -255,7 +319,7 @@ impl PerformanceCollector {
     }
 
     fn calculate_client_total_time(&self) -> f64 {
-        self.witness_generation_time_ms + self.witness_secret_sharing_time_ms
+        self.witness_generation_time_ms + self.mpc_r1cs_to_qap_ms + self.witness_secret_sharing_time_ms + self.client_share_serialization_time_ms
     }
 
     fn save_metrics(&self, circuit_info: &CircuitInfo, proof_size: usize, commitment_size: u64) {
@@ -272,7 +336,10 @@ impl PerformanceCollector {
             ("witness_generation_ms".to_string(), self.witness_generation_time_ms.to_string()),
             ("witness_secret_sharing_ms".to_string(), self.witness_secret_sharing_time_ms.to_string()),
             ("r1cs_to_qap_ms".to_string(), self.mpc_r1cs_to_qap_ms.to_string()),
+            ("client_share_serialization_ms".to_string(), self.client_share_serialization_time_ms.to_string()),
             ("client_total_time_ms".to_string(), client_total_time.to_string()),
+            ("client_to_server_total_payload_bytes".to_string(), self.client_to_server_total_payload_bytes.to_string()),
+            ("client_to_server_max_share_payload_bytes".to_string(), self.client_to_server_max_share_payload_bytes.to_string()),
             
             // MPC时间（最慢方）
             ("mpc_preprocessing_ms".to_string(), self.mpc_preprocessing_time_ms.to_string()),
@@ -283,6 +350,9 @@ impl PerformanceCollector {
             ("mpc_b_g2_computation_ms".to_string(), self.mpc_b_g2_computation_ms.to_string()),
             ("mpc_c_computation_ms".to_string(), self.mpc_c_computation_ms.to_string()),
             ("mpc_reconstruction_ms".to_string(), self.mpc_reconstruction_time_ms.to_string()),
+            ("mpc_server_to_server_total_payload_bytes".to_string(), self.mpc_server_to_server_total_payload_bytes.to_string()),
+            ("mpc_server_to_server_max_sent_payload_bytes".to_string(), self.mpc_server_to_server_max_sent_payload_bytes.to_string()),
+            ("mpc_server_to_server_max_received_payload_bytes".to_string(), self.mpc_server_to_server_max_received_payload_bytes.to_string()),
             
             // 其他指标
             ("circuit_building_ms".to_string(), self.circuit_building_time_ms.to_string()),
@@ -291,6 +361,10 @@ impl PerformanceCollector {
             ("total_task_time_ms".to_string(), total_time.to_string()),
             ("proof_size_bytes".to_string(), proof_size.to_string()),
             ("commitment_size_bytes".to_string(), commitment_size.to_string()),
+            ("public_inputs_payload_bytes".to_string(), self.public_inputs_payload_bytes.to_string()),
+            ("server_to_aggregator_cryptographic_payload_bytes".to_string(), self.server_to_aggregator_cryptographic_payload_bytes.to_string()),
+            ("server_to_aggregator_json_artifact_bytes".to_string(), self.server_to_aggregator_json_artifact_bytes.to_string()),
+            ("process_peak_rss_bytes".to_string(), self.process_peak_rss_bytes.to_string()),
             
             // 电路信息
             ("constraint_count".to_string(), circuit_info.num_constraints.to_string()),
@@ -706,7 +780,7 @@ fn should_use_crs_cache(task_id: usize, cache_key: &str) -> bool {
     task_id > 0 && Path::new(&format!("proof_data/cache/crs_ready_{}.flag", cache_key)).exists()
 }
 
-/// 分布式 MPC 证明生成函数（使用arkworks标准计时）
+/// Distributed MPC proving; metric timers are independent of ark-std trace logging.
 #[allow(clippy::too_many_arguments)]
 async fn distributed_mpc_proof_generation<E, Net>(
     pp: &PackedSharingParams<E::ScalarField>,
@@ -732,18 +806,21 @@ where
 {
     let mut metrics = MpcDetailedMetrics::new();
     
-    // 使用arkworks标准计时宏，正确的用法
+    // Keep measurement active even when the print-trace feature is disabled.
+    let mpc_section_start = Instant::now();
     let mpc_section = start_timer!(|| "MPC MSM operations");
     
     // 1. H计算计时
+    let compute_h_start = Instant::now();
     let compute_h = start_timer!(|| "H computation");
     let h_share = ext_wit::circom_h(qap_share, fft_mask, f_degred_mask, pp, &net)
         .await
         .unwrap();
     end_timer!(compute_h);
-    metrics.h_computation_ms = compute_h.time.elapsed().as_millis() as f64;
+    metrics.h_computation_ms = compute_h_start.elapsed().as_millis() as f64;
     
     // 2. A计算计时
+    let compute_a_start = Instant::now();
     let compute_a = start_timer!(|| "A computation");
     let pi_a_share = groth16::prove::A::<E> {
         L: crs_share.a_query0,
@@ -758,9 +835,10 @@ where
     .await
     .unwrap();
     end_timer!(compute_a);
-    metrics.a_computation_ms = compute_a.time.elapsed().as_millis() as f64;
+    metrics.a_computation_ms = compute_a_start.elapsed().as_millis() as f64;
 
     // 3. B(G1)计算计时
+    let compute_b_g1_start = Instant::now();
     let compute_b_g1 = start_timer!(|| "Compute B in G1");
     let pi_b_g1_share: E::G1 = groth16::prove::BInG1::<E> {
         Z: crs_share.b_g1_query0,
@@ -776,9 +854,10 @@ where
     .await
     .unwrap();
     end_timer!(compute_b_g1);
-    metrics.b_g1_computation_ms = compute_b_g1.time.elapsed().as_millis() as f64;
+    metrics.b_g1_computation_ms = compute_b_g1_start.elapsed().as_millis() as f64;
     
     // 4. B(G2)计算计时
+    let compute_b_g2_start = Instant::now();
     let compute_b_g2 = start_timer!(|| "Compute B in G2");
     let pi_b_g2_share: E::G2 = groth16::prove::BInG2::<E> {
         Z: crs_share.b_g2_query0,
@@ -793,9 +872,10 @@ where
     .await
     .unwrap();
     end_timer!(compute_b_g2);
-    metrics.b_g2_computation_ms = compute_b_g2.time.elapsed().as_millis() as f64;
+    metrics.b_g2_computation_ms = compute_b_g2_start.elapsed().as_millis() as f64;
 
     // 5. C计算计时
+    let compute_c_start = Instant::now();
     let compute_c = start_timer!(|| "Compute C");
     let pi_c_share = match (groth16::prove::C::<E> {
         W: &crs_share.w,
@@ -820,14 +900,14 @@ where
         }
     };
     end_timer!(compute_c);
-    metrics.c_computation_ms = compute_c.time.elapsed().as_millis() as f64;
+    metrics.c_computation_ms = compute_c_start.elapsed().as_millis() as f64;
 
     local_completion_barrier.wait().await;
 
     end_timer!(mpc_section);
     
     // 计算总的纯计算时间
-    metrics.total_pure_computation_ms = mpc_section.time.elapsed().as_millis() as f64;
+    metrics.total_pure_computation_ms = mpc_section_start.elapsed().as_millis() as f64;
 
     (pi_a_share, pi_b_g2_share, pi_c_share, metrics)
 }
@@ -922,14 +1002,22 @@ async fn main() {
     // 2. 客户端工作：witness生成
     let witness_gen_start = Instant::now();
     let msg_array = witness.password_to_bytes(20);
-    let k_value = witness.k_to_int();
+    let salt_array = match witness.salt_to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Invalid salt input: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let mut builder = CircomBuilder::new(cfg.clone());
     // 添加输入
     for &byte_val in msg_array.iter() {
         builder.push_input("msg", byte_val as i32);
     }
-    builder.push_input("k", k_value);
+    for &byte_val in salt_array.iter() {
+        builder.push_input("salt", byte_val as i32);
+    }
     builder.push_input("expected_match", expected_match);
 
     let circom = builder.clone().build().unwrap();
@@ -953,7 +1041,9 @@ async fn main() {
     for _ in 0..20 {
         setup_builder.push_input("msg", 0i32);
     }
-    setup_builder.push_input("k", 0i32);
+    for _ in 0..20 {
+        setup_builder.push_input("salt", 0i32);
+    }
     setup_builder.push_input("expected_match", 0i32);
 
     let (pk, vk) = if crs_cache_available && should_use_cache(task_id) {
@@ -1236,10 +1326,21 @@ async fn main() {
     drop(full_assignment);
     perf_collector.record_witness_secret_sharing(client_sharing_start.elapsed().as_millis() as f64);
 
+    let share_serialization_start = Instant::now();
+    let per_server_share_payload_bytes = a_shares.iter().zip(ax_shares.iter())
+        .map(|(a_share, ax_share)| {
+            (a_share.serialized_size(Compress::Yes) + ax_share.serialized_size(Compress::Yes)) as u64
+        })
+        .collect::<Vec<_>>();
+    perf_collector.record_client_share_transport(
+        share_serialization_start.elapsed().as_nanos() as f64 / 1_000_000.0,
+        &per_server_share_payload_bytes,
+    );
+
     // 8. MPC计算：分离纯计算时间和网络开销
     let mpc_total_start = Instant::now();
     let local_completion_barrier = Arc::new(Barrier::new(pp.n));
-    let result: Vec<(G1, G2, G1, MpcDetailedMetrics)> = network
+    let result: Vec<(G1, G2, G1, MpcDetailedMetrics, mpc_net::multi::MpcCommunicationStats)> = network
         .simulate_network_round(
             (crs_shares, pp, a_shares, ax_shares, qap_shares, r_shares, s_shares, fft_masks, f_degred_masks, g1_msm_mask, g2_msm_masks, local_completion_barrier,),
             |net, (crs_shares, pp, a_shares, ax_shares, qap_shares, r_shares, s_shares, fft_masks, f_degred_masks, g1_msm_mask, g2_msm_masks, local_completion_barrier,)| async move {
@@ -1268,7 +1369,7 @@ async fn main() {
                     g1_msm_mask[3][virtual_party_idx].clone(),
                 ];
 
-                distributed_mpc_proof_generation(
+                let (pi_a_share, pi_b_g2_share, pi_c_share, metrics) = distributed_mpc_proof_generation(
                     &pp,
                     crs_share,
                     qap_share,
@@ -1282,19 +1383,25 @@ async fn main() {
                     g2_msm_mask,
                     local_completion_barrier,
                     &net,
-                ).await
+                ).await;
+                let communication_stats = net.communication_stats();
+                (pi_a_share, pi_b_g2_share, pi_c_share, metrics, communication_stats)
             },
         ).await;
     // 提取所有参与方的metrics并选择最慢的
-    let all_party_metrics: Vec<MpcDetailedMetrics> = result.iter().map(|(_, _, _, metrics)| metrics.clone()).collect();
+    let all_party_metrics: Vec<MpcDetailedMetrics> = result.iter().map(|(_, _, _, metrics, _)| metrics.clone()).collect();
     perf_collector.record_slowest_mpc_metrics(&all_party_metrics);
+    if let Some((_, _, _, _, communication_stats)) = result.last() {
+        perf_collector.record_mpc_communication(communication_stats);
+        save_mpc_party_communication(task_id, communication_stats);
+    }
 
     // 9. MPC阶段3：重构
     let mpc_reconstruction_start = Instant::now();
     let mut a_shares = Vec::new();
     let mut b_shares = Vec::new();
     let mut c_shares = Vec::new();
-    for (a_share, b_share, c_share, _metrics) in result.into_iter() {
+    for (a_share, b_share, c_share, _metrics, _communication_stats) in result.into_iter() {
         a_shares.push(a_share);
         b_shares.push(b_share);
         c_shares.push(c_share);
@@ -1340,9 +1447,19 @@ async fn main() {
             0
         }
     };
-    // 11. 序列化证明
+    // 11. Serialize the proof artifact sent from the proving servers to the aggregator.
     let serialization_start = Instant::now();
+    let public_inputs_payload_bytes = public_inputs.serialized_size(Compress::Yes) as u64;
     let serializable_proof = SerializableProof::from_groth16_proof(&mpc_proof, &public_inputs);
+    let proof_json = serde_json::to_string_pretty(&serializable_proof).unwrap();
+    let proof_json_artifact_bytes = proof_json.len() as u64;
+    perf_collector.record_serialization(serialization_start.elapsed().as_nanos() as f64 / 1_000_000.0);
+    perf_collector.record_proof_transport(
+        public_inputs_payload_bytes,
+        proof_size as u64 + public_inputs_payload_bytes,
+        proof_json_artifact_bytes,
+    );
+    perf_collector.record_process_peak_rss();
     
     // 创建proof_data目录
     fs::create_dir_all("proof_data").expect("Failed to create proof_data directory");
@@ -1352,10 +1469,9 @@ async fn main() {
         
         // 保存证明文件，使用任务ID(task_id)作为文件名
         let proof_filename = format!("proof_data/regex_proof_{}.json", task_id);  // task_id是任务ID
-        let proof_json = serde_json::to_string_pretty(&serializable_proof).unwrap();
 
         // 保存proof到文件（可选，用于验证等）
-        match fs::write(&proof_filename, proof_json) {
+        match fs::write(&proof_filename, &proof_json) {
             Ok(_) => {
                 println!("✅ Task {} proof saved to: {}", task_id, proof_filename);
             },
@@ -1386,10 +1502,8 @@ async fn main() {
         perf_collector.save_metrics(&circuit_info, proof_size, commitment_size);
     }
     
-    perf_collector.record_serialization(serialization_start.elapsed().as_millis() as f64);
-
     // 最后的性能输出（删除arkworks比较和不存在的字段）
-    println!("✅ Task {} completed successfully", party_id);
+    println!("✅ Task {} completed successfully", task_id);
     println!("📊 Performance Summary:");
     println!("  ├─ Witness generation: {:.2} ms", perf_collector.witness_generation_time_ms);
     println!("  ├─ Circuit building: {:.2} ms", perf_collector.circuit_building_time_ms);

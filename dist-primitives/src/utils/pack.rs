@@ -2,6 +2,8 @@ use ark_ff::FftField;
 use ark_poly::domain::DomainCoeff;
 use ark_std::{cfg_chunks, UniformRand};
 use rand::thread_rng;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use secret_sharing::pss::PackedSharingParams;
 
 // TODO: maybe make this an impl of pp?
@@ -11,14 +13,14 @@ pub fn pack_vec<F: FftField, T: DomainCoeff<F> + UniformRand>(
 ) -> Vec<Vec<T>> {
     debug_assert_eq!(secrets.len() % pp.l, 0, "Mismatch of size in pack_vec");
 
-    let rng = &mut thread_rng();
-
     // pack shares
     cfg_chunks!(secrets, pp.l)
-        .map(|x| pp.pack(x.to_vec(), rng))
+        .map(|x| {
+            let mut rng = thread_rng();
+            pp.pack(x.to_vec(), &mut rng)
+        })
         .collect::<Vec<_>>()
 }
-
 pub fn transpose<T: Clone>(matrix: Vec<Vec<T>>) -> Vec<Vec<T>> {
     assert!(!matrix.is_empty());
     let cols = matrix[0].len();

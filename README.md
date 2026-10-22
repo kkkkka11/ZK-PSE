@@ -9,73 +9,101 @@ ZK-PSE combines several zero-knowledge and secure computation techniques. Passwo
 ## Requirements
 
 - Rust toolchain from `rust-toolchain.toml`
-- Node.js and npm
-- `circom`
-- A `zk-regex` compiler that supports `decomposed --shared-input true`
+- Node.js and npm (tested with Node.js 18.19.1)
+- `circom` 2.1.5
+- The modified `zk-regex` compiler included in [`regex/zk-regex-compiler-v2`](regex/zk-regex-compiler-v2)
 
-The generator first checks `regex/target/release/zk-regex`. Otherwise set:
+The compiler is based on upstream `zkemail/zk-regex` version `2.3.2`, commit
+`4fb1bda1af71123f57f4877c29ebcb9004266fd8`, with a local patch for multiple DFA
+accept states. Its source and build instructions are included in this repository.
+`--shared-input` is implemented by `regex/build_lookahead_circuits.js`, which
+converts the compiler's Circom output; it is not a compiler CLI option.
 
-```bash
-export ZK_REGEX_BIN=/path/to/zk-regex
-```
+The Rust build was tested with `rustc 1.89.0-nightly (59aa1e873 2025-06-03)`.
+The checked-in Cargo and npm lock files pin dependencies.
 
 ## Install
 
 ```bash
-npm install
-cargo check --workspace
+npm ci
+cargo build --locked --release -p zk-regex-compiler --bin zk-regex \
+  --manifest-path regex/zk-regex-compiler-v2/Cargo.toml
+cargo check --locked --workspace
 ```
 
 ## Generate Circuits
 
 Policies are defined in `regex/password_policies_5.txt`. The circuit generator
 splits a policy into regex lookahead checks and wraps them with a Poseidon hash
-binding over the private password bytes.
+binding over the private password bytes and the full 20-byte salt.
 
 Shared-input optimized circuits:
 
 ```bash
-cd regex
-node build_lookahead_circuits.js password_policies_5.txt ../fixtures/password_policies_5_ascii \
+node regex/build_lookahead_circuits.js regex/password_policies_5.txt fixtures/password_policies_5_ascii \
   --compile \
   --shared-input true \
   --dot ascii
-cd ..
 ```
 
 No-share baseline circuits:
 
 ```bash
-cd regex
-node build_lookahead_circuits.js password_policies_5.txt ../fixtures/password_policies_5_ascii_noshare \
+node regex/build_lookahead_circuits.js regex/password_policies_5.txt fixtures/password_policies_5_ascii_noshare \
   --compile \
   --shared-input false \
   --gen-substrs \
   --dot ascii
-cd ..
 ```
 
-The shared-input version lets all regex subcircuits reuse one private byte
-array. The no-share baseline keeps the original per-subcircuit input handling
-and is useful for comparison.
+`G16-SI` uses shared input checks and disables substring/reveal helper logic.
+`G16-Base` uses separate input checks in each DFA and enables substring/reveal
+helpers (`--gen-substrs`). Both use the same patched compiler, policies, and
+Poseidon password/salt commitment. This comparison includes both optimizations.
+
+## G16-SI / G16-Base Comparison
+
+After generating both circuit sets above, run the single-prover Groth16 benchmark:
+
+```bash
+cargo build --locked --release --example password_policy_arkworks_benchmark --features parallel
+RAYON_NUM_THREADS=1 ./target/release/examples/password_policy_arkworks_benchmark \
+  --variant all --max-tasks 64 --repeats 5 --setup-repeats 5 \
+  --out benchmark_results/g16_baselines
+```
+
+This evaluates all five policies with the checked-in good and bad witnesses.
+The output contains `setup_raw.csv`, `proof_raw.csv`, and `summary.csv` with
+constraint counts, setup/proving/verification times, compressed proof sizes,
+and success/failure counts. Setup and witness generation are outside the proof
+timer. Use `--regex-id`, `--variant`, or `--help` to select a smaller run.
+Timing results depend on hardware and thread settings.
 
 ## Build
 
 ```bash
-cargo build --release --example regex --features parallel
-cargo build --release --bin aggregation_server
+cargo build --locked --release --example regex --features parallel
+cargo build --locked --release --bin aggregation_server
 ```
 
 ## Run One Experiment
 
-The checked-in scripts run Regex 1 with either good or bad witnesses. Set
-`SKIP_AGGREGATION=1` when you only want proof generation.
+The existing scripts run Regex 1 through witness generation, MPC proving,
+individual verification, proof aggregation, and aggregate verification. MPC
+parties are simulated within one process using an in-memory network. The example
+below uses `n=16`, packing parameter `l=2`, and threshold `t=2`.
+Set `SKIP_AGGREGATION=1` when you only want proof generation.
+
+Witnesses are in `fixtures/regex/witness-good` and `witness-bad`; `k` is a
+40-character hexadecimal salt. Good/bad runs prove policy outputs 1/0 respectively.
+Task and aggregation metrics are written under `logs/metrics/`; each run also
+archives its logs and proofs under `logs_1_good/` / `proof_data_1_good/` (or `1_bad`).
 
 Proof only:
 
 ```bash
 SKIP_BUILD=1 SKIP_AGGREGATION=1 NUM_TASKS=64 \
-N_PARAM=16 L_PARAM=2 T_PARAM=2 RAYON_NUM_THREADS=1 \
+N_PARAM=16 L_PARAM=2 T_PARAM=2 RAYON_NUM_THREADS=1 AGGREGATION_RAYON_NUM_THREADS=2 \
 ./scripts/regex_1_good.zsh
 ```
 
@@ -83,7 +111,7 @@ Proof plus aggregation:
 
 ```bash
 SKIP_BUILD=1 NUM_TASKS=64 AGGREGATION_REPEATS=50 \
-N_PARAM=16 L_PARAM=2 T_PARAM=2 RAYON_NUM_THREADS=1 \
+N_PARAM=16 L_PARAM=2 T_PARAM=2 RAYON_NUM_THREADS=1 AGGREGATION_RAYON_NUM_THREADS=2 \
 ./scripts/regex_1_good.zsh
 ```
 
@@ -91,7 +119,7 @@ Bad witnesses:
 
 ```bash
 SKIP_BUILD=1 NUM_TASKS=64 \
-N_PARAM=16 L_PARAM=2 T_PARAM=2 RAYON_NUM_THREADS=1 \
+N_PARAM=16 L_PARAM=2 T_PARAM=2 RAYON_NUM_THREADS=1 AGGREGATION_RAYON_NUM_THREADS=2 \
 ./scripts/regex_1_bad.zsh
 ```
 
@@ -100,13 +128,14 @@ N_PARAM=16 L_PARAM=2 T_PARAM=2 RAYON_NUM_THREADS=1 \
 Use this for a quick local sanity check before a longer run.
 
 ```bash
-node regex/build_lookahead_circuits.js regex/smoke_policy.txt fixtures/password_policies_5_ascii \
+node regex/build_lookahead_circuits.js regex/smoke_policy.txt fixtures/smoke_policy \
   --compile \
   --no-shared-input \
   --dot ascii
-cargo build --release --example regex --features parallel
-cargo build --release --bin aggregation_server
-NUM_TASKS=2 AGGREGATION_REPEATS=1 SKIP_BUILD=1 ./scripts/regex_1_good.zsh
+cargo build --locked --release --example regex --features parallel
+cargo build --locked --release --bin aggregation_server
+CIRCUIT_SET_DIR=./fixtures/smoke_policy NUM_TASKS=2 AGGREGATION_REPEATS=1 \
+SKIP_BUILD=1 RAYON_NUM_THREADS=1 AGGREGATION_RAYON_NUM_THREADS=2 ./scripts/regex_1_good.zsh
 ```
 
 ## Acknowledgements

@@ -18,6 +18,15 @@ use ark_ec::AffineRepr;
 mod csv_logger;
 use csv_logger::CSVLogger;
 
+fn process_peak_rss_bytes() -> u64 {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| status.lines().find(|line| line.starts_with("VmHWM:")).map(str::to_owned))
+        .and_then(|line| line.split_whitespace().nth(1).and_then(|value| value.parse::<u64>().ok()))
+        .map(|kib| kib * 1024)
+        .unwrap_or(0)
+}
+
 // 性能收集器
 struct AggregationPerformanceCollector {
     start_time: Instant,
@@ -33,6 +42,10 @@ struct AggregationPerformanceCollector {
     aggregation_computation_ms: f64,
     aggregate_verification_ms: f64,
     file_generation_ms: f64,
+    aggregator_input_json_bytes: u64,
+    public_inputs_payload_bytes: u64,
+    aggregator_to_verifier_payload_bytes: u64,
+    process_peak_rss_bytes: u64,
 }
 
 impl AggregationPerformanceCollector {
@@ -51,6 +64,10 @@ impl AggregationPerformanceCollector {
             aggregation_computation_ms: 0.0,
             aggregate_verification_ms: 0.0,
             file_generation_ms: 0.0,
+            aggregator_input_json_bytes: 0,
+            public_inputs_payload_bytes: 0,
+            aggregator_to_verifier_payload_bytes: 0,
+            process_peak_rss_bytes: 0,
         }
     }
 
@@ -114,6 +131,13 @@ impl AggregationPerformanceCollector {
         }
     }
 
+    fn record_transport(&mut self, input_json_bytes: u64, public_inputs_payload_bytes: u64, aggregate_proof_size: u64) {
+        self.aggregator_input_json_bytes = input_json_bytes;
+        self.public_inputs_payload_bytes = public_inputs_payload_bytes;
+        self.aggregator_to_verifier_payload_bytes = aggregate_proof_size + public_inputs_payload_bytes;
+        self.process_peak_rss_bytes = process_peak_rss_bytes();
+    }
+
     fn save_metrics(&self, num_proofs: usize, aggregate_proof_size: u64, compression_ratio: f64) {
         let csv_logger = CSVLogger::new("logs/metrics/aggregation_metrics.csv");
         
@@ -129,6 +153,10 @@ impl AggregationPerformanceCollector {
             ("file_generation_ms", self.file_generation_ms.to_string()),
             ("aggregation_total_ms", total_time.to_string()),
             ("aggregate_proof_size_bytes", aggregate_proof_size.to_string()),
+            ("aggregator_input_json_bytes", self.aggregator_input_json_bytes.to_string()),
+            ("public_inputs_payload_bytes", self.public_inputs_payload_bytes.to_string()),
+            ("aggregator_to_verifier_payload_bytes", self.aggregator_to_verifier_payload_bytes.to_string()),
+            ("process_peak_rss_bytes", self.process_peak_rss_bytes.to_string()),
             ("compression_ratio", compression_ratio.to_string()),
         ];
 
@@ -519,34 +547,52 @@ fn generate_bn254_parameters() -> BN254CurveParameters {
     }
 }
 
-fn load_proofs_from_directory(dir_path: &str) -> Result<Vec<SerializableProof>, Box<dyn std::error::Error>> {
+fn load_proofs_from_directory(
+    dir_path: &str,
+) -> Result<(Vec<(usize, SerializableProof)>, u64), Box<dyn std::error::Error>> {
     let mut all_proofs = Vec::new();
-    
-    let entries = fs::read_dir(dir_path)?;
-    
-    for entry in entries {
+    let mut total_json_bytes = 0u64;
+    let mut proof_paths: Vec<(usize, std::path::PathBuf)> = Vec::new();
+
+    for entry in fs::read_dir(dir_path)? {
         let entry = entry?;
         let path = entry.path();
-        
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
-            let filename = path.file_name().unwrap().to_str().unwrap();
-            if filename.starts_with("regex_proof_") && filename.ends_with(".json") {
-                let content = fs::read_to_string(&path)?;
-                
-                match serde_json::from_str::<SerializableProof>(&content) {
-                    Ok(proof) => {
-                        all_proofs.push(proof);
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to load proof {}: {}", filename, e);
-                        return Err(e.into());
-                    }
-                }
-            }
+        if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+
+        let filename = path.file_name().and_then(|name| name.to_str())
+            .ok_or("proof filename is not valid UTF-8")?;
+        if !filename.starts_with("regex_proof_") || !filename.ends_with(".json") {
+            continue;
+        }
+
+        let task_id = filename
+            .strip_prefix("regex_proof_")
+            .and_then(|value| value.strip_suffix(".json"))
+            .ok_or_else(|| format!("invalid proof filename: {filename}"))?
+            .parse::<usize>()
+            .map_err(|_| format!("proof filename must contain a numeric task id: {filename}"))?;
+        proof_paths.push((task_id, path));
+    }
+
+    proof_paths.sort_by_key(|(task_id, _)| *task_id);
+    for pair in proof_paths.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(format!("duplicate proof task id: {}", pair[0].0).into());
         }
     }
-    
-    Ok(all_proofs)
+
+    for (task_id, path) in proof_paths {
+        let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or("<unknown>");
+        let content = fs::read_to_string(&path)?;
+        total_json_bytes += content.len() as u64;
+        let proof = serde_json::from_str::<SerializableProof>(&content)
+            .map_err(|error| format!("failed to parse task {task_id} ({filename}): {error}"))?;
+        all_proofs.push((task_id, proof));
+    }
+
+    Ok((all_proofs, total_json_bytes))
 }
 
 fn load_verification_key(vk_path: &str) -> Result<VerifyingKey<Bn254>, Box<dyn std::error::Error>> {
@@ -561,12 +607,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <proofs_directory> [verification_key_path]", args[0]);
+        eprintln!("Usage: {} <proofs_directory> [verification_key_path] [expected_proof_count]", args[0]);
         std::process::exit(1);
     }
 
     let proofs_dir = &args[1];
     let vk_path = args.get(2).map(|s| s.as_str()).unwrap_or("./proof_data/proof_data/cache/verifying_key.bin");
+    let expected_proof_count = args
+        .get(3)
+        .map(|value| value.parse::<usize>())
+        .transpose()?;
 
     let mut perf_collector = AggregationPerformanceCollector::new();
 
@@ -578,33 +628,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     perf_collector.start_proof_loading();
-    let serializable_proofs = load_proofs_from_directory(proofs_dir)?;
+    let (serializable_proofs, aggregator_input_json_bytes) = load_proofs_from_directory(proofs_dir)?;
     if serializable_proofs.is_empty() {
-        eprintln!("No proofs found in directory: {}", proofs_dir);
-        std::process::exit(1);
+        return Err(format!("no proofs found in directory: {proofs_dir}").into());
     }
 
-    println!("Total proofs loaded: {}", serializable_proofs.len());
-
-    let mut proofs = Vec::new();
-    let mut all_public_inputs = Vec::new();
-    
-    for (i, serializable_proof) in serializable_proofs.iter().enumerate() {
-        match serializable_proof.to_groth16_proof() {
-            Ok((proof, public_inputs)) => {
-                proofs.push(proof);
-                all_public_inputs.push(public_inputs);
-            }
-            Err(e) => {
-                eprintln!("Failed to convert proof {}: {}", i + 1, e);
-                continue;
+    if let Some(expected) = expected_proof_count {
+        if serializable_proofs.len() != expected {
+            return Err(format!(
+                "proof count mismatch: expected {expected}, found {}",
+                serializable_proofs.len()
+            ).into());
+        }
+        for (position, (task_id, _)) in serializable_proofs.iter().enumerate() {
+            if *task_id != position {
+                return Err(format!(
+                    "proof task ids must be exactly 0..{}; found task id {task_id} at sorted position {position}",
+                    expected.saturating_sub(1)
+                ).into());
             }
         }
     }
 
-    if proofs.is_empty() {
-        eprintln!("No valid proofs could be loaded");
-        std::process::exit(1);
+    println!("Total proofs loaded in task-id order: {}", serializable_proofs.len());
+
+    let mut proofs = Vec::with_capacity(serializable_proofs.len());
+    let mut all_public_inputs = Vec::with_capacity(serializable_proofs.len());
+    for (task_id, serializable_proof) in &serializable_proofs {
+        let (proof, public_inputs) = serializable_proof
+            .to_groth16_proof()
+            .map_err(|error| format!("failed to decode proof for task {task_id}: {error}"))?;
+        proofs.push(proof);
+        all_public_inputs.push(public_inputs);
     }
 
     let vk = load_verification_key(vk_path)?;
@@ -638,12 +693,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     perf_collector.finish_srs_setup();
 
     let gamma_abc_len = vk.gamma_abc_g1.len();
-    let expected_len = all_public_inputs[0].len() + 1;
-    let dimensions_match = gamma_abc_len == expected_len;
-    
-    if !dimensions_match {
-        println!("Verification key and public inputs dimension mismatch");
-        std::process::exit(1);
+    for (index, public_inputs) in all_public_inputs.iter().enumerate() {
+        if gamma_abc_len != public_inputs.len() + 1 {
+            return Err(format!(
+                "verification key/public-input dimension mismatch for sorted proof index {index}: vk has {gamma_abc_len} gamma_abc points, proof has {} public inputs",
+                public_inputs.len()
+            ).into());
+        }
     }
 
     perf_collector.start_aggregation_computation();
@@ -666,14 +722,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 诊断agg_c
     let _serialized_agg_c = simple_point_diagnosis(&aggregate_proof.agg_c);
 
-    let compressed_size = aggregate_proof.serialized_size(ark_serialize::Compress::Yes);
-    let uncompressed_size = aggregate_proof.serialized_size(ark_serialize::Compress::No);
+    let mut aggregate_proof_bytes = Vec::new();
+    aggregate_proof.serialize_compressed(&mut aggregate_proof_bytes)?;
+    let compressed_size = aggregate_proof_bytes.len();
+
+    let mut aggregate_proof_uncompressed_bytes = Vec::new();
+    aggregate_proof.serialize_uncompressed(&mut aggregate_proof_uncompressed_bytes)?;
+    let uncompressed_size = aggregate_proof_uncompressed_bytes.len();
+
+    let mut public_inputs_bytes = Vec::new();
+    all_public_inputs.serialize_compressed(&mut public_inputs_bytes)?;
 
     println!("Real aggregate proof sizes:");
     println!("  Compressed: {} bytes", compressed_size);
     println!("  Uncompressed: {} bytes", uncompressed_size);
 
     let real_aggregate_proof_size = compressed_size as u64;
+    let public_inputs_payload_bytes = public_inputs_bytes.len() as u64;
 
     let single_compressed_size = proofs[0].serialized_size(ark_serialize::Compress::Yes);
     let total_individual_size = num_proofs * single_compressed_size;
@@ -715,12 +780,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 保存二进制格式的聚合证明
     let proof_file_path = "./proof_data/agg/aggregate_proof.bin";
-    match std::fs::File::create(proof_file_path) {
-        Ok(mut file) => {
-            let _ = aggregate_proof.serialize_compressed(&mut file);
-        }
-        Err(_) => {}
-    }
+    fs::write(proof_file_path, &aggregate_proof_bytes)?;
 
     // 转换为Solidity格式
     println!("Converting aggregate proof to Solidity format...");
@@ -749,8 +809,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let public_inputs_path = "./proof_data/agg/public_inputs_solidity.json";
     fs::write(public_inputs_path, serde_json::to_string_pretty(&solidity_public_inputs)?)?;
 
-    let mut public_inputs_bytes = Vec::new();
-    all_public_inputs.serialize_compressed(&mut public_inputs_bytes)?;
     let public_inputs_bin_path = "./proof_data/agg/public_inputs.bin";
     fs::write(public_inputs_bin_path, &public_inputs_bytes)?;
 
@@ -812,6 +870,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // 保存性能指标
     println!("Saving performance metrics to CSV...");
+    perf_collector.record_transport(aggregator_input_json_bytes, public_inputs_payload_bytes, real_aggregate_proof_size);
     perf_collector.save_metrics(num_proofs, real_aggregate_proof_size, real_compression_ratio);
     
     println!("\nAggregation completed successfully with fixed serialization!");

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 if [ "$#" -lt 4 ]; then
   echo "Usage: $0 <label> <r1cs_file> <wasm_dir> <archive_suffix> [default_num_tasks]"
@@ -24,6 +24,7 @@ T_PARAM="${T_PARAM:-2}"
 N_PARAM="${N_PARAM:-16}"
 M_PARAM="${M_PARAM:-32768}"
 AGGREGATION_REPEATS="${AGGREGATION_REPEATS:-10}"
+AGGREGATION_RAYON_NUM_THREADS="${AGGREGATION_RAYON_NUM_THREADS:-$(nproc)}"
 NETWORK_CONFIG_DIR="${NETWORK_CONFIG_DIR:-./network-address}"
 PROOF_BIN="./target/release/examples/regex"
 AGGREGATION_BIN="./target/release/aggregation_server"
@@ -37,7 +38,9 @@ get_metric_from_csv() {
   local metric_name="$2"
 
   if [ -f "$csv_file" ]; then
-    grep "^$metric_name," "$csv_file" | cut -d',' -f2 | head -n1
+    local value
+    value="$(awk -F, -v key="$metric_name" '$1 == key { print $2; exit }' "$csv_file")"
+    echo "${value:-0}"
   else
     echo "0"
   fi
@@ -139,7 +142,7 @@ run_local_mpc_simulation() {
     local log_file="logs/task${task_id}_local_mpc.log"
 
     log_status "Task $task_id: $witness_file"
-    RUST_BACKTRACE=1 RUST_LOG=info "$PROOF_BIN" \
+    if ! RUST_BACKTRACE=1 RUST_LOG=info "$PROOF_BIN" \
       0 \
       "$task_id" \
       "$NETWORK_CONFIG_DIR/$N_PARAM" \
@@ -150,7 +153,10 @@ run_local_mpc_simulation() {
       "$witness_file" \
       "$EXPECTED_MATCH" \
       "$N_PARAM" \
-      2>&1 | tee "$log_file"
+      2>&1 | tee "$log_file"; then
+      log_status "Task $task_id failed. See $log_file; stopping before aggregation."
+      exit 1
+    fi
   done
 }
 
@@ -257,9 +263,18 @@ run_aggregation_if_possible() {
   local proof_count
   local run_id
 
+  if [ "${SKIP_AGGREGATION:-0}" = "1" ]; then
+    log_status "Skipping aggregation because SKIP_AGGREGATION=1"
+    return
+  fi
+
   proof_count="$(find proof_data -maxdepth 1 -name 'regex_proof_*.json' | wc -l | tr -d ' ')"
   if [ "$proof_count" -eq 0 ]; then
     echo "Error: no proof_data/regex_proof_*.json files were generated"
+    exit 1
+  fi
+  if [ "$proof_count" -ne "$NUM_TASKS" ]; then
+    echo "Error: expected $NUM_TASKS proof files, found $proof_count; refusing incomplete aggregation"
     exit 1
   fi
 
@@ -268,17 +283,20 @@ run_aggregation_if_possible() {
     exit 1
   fi
 
-  if [ "${SKIP_AGGREGATION:-0}" = "1" ]; then
-    log_status "Skipping aggregation because SKIP_AGGREGATION=1"
-    return
-  fi
-
   log_status "Aggregating $proof_count proofs ($AGGREGATION_REPEATS repeats)"
   for run_id in $(seq 1 "$AGGREGATION_REPEATS"); do
     log_status "Aggregation run $run_id/$AGGREGATION_REPEATS"
-    RUST_BACKTRACE=1 RUST_LOG=info "$AGGREGATION_BIN" ./proof_data ./proof_data/verification_key.bin \
+    # aggregation_server appends to this path. Start each repeat with a fresh
+    # file so aggregation_run_N_metrics.csv is exactly one measurement.
+    rm -f "$METRICS_DIR/aggregation_metrics.csv"
+    RAYON_NUM_THREADS="$AGGREGATION_RAYON_NUM_THREADS" RUST_BACKTRACE=1 RUST_LOG=info \
+      "$AGGREGATION_BIN" ./proof_data ./proof_data/verification_key.bin "$NUM_TASKS" \
       2>&1 | tee "logs/aggregation_run_${run_id}.log"
-    cp "$METRICS_DIR/aggregation_metrics.csv" "$METRICS_DIR/aggregation_run_${run_id}_metrics.csv"
+    if [ ! -f "$METRICS_DIR/aggregation_metrics.csv" ]; then
+      echo "Error: aggregation run $run_id did not produce metrics"
+      exit 1
+    fi
+    mv "$METRICS_DIR/aggregation_metrics.csv" "$METRICS_DIR/aggregation_run_${run_id}_metrics.csv"
   done
 }
 
@@ -288,20 +306,20 @@ generate_benchmark_csvs() {
   local summary_csv="$METRICS_DIR/benchmark_summary.csv"
   local i
 
-  echo "label,task_id,witness_file,expected_match,constraints,client_time_ms,proof_size_bytes,commitment_size_bytes,setup_time_ms,mpc_preprocessing_time_ms" > "$proof_raw_csv"
+  echo "label,task_id,witness_file,expected_match,constraints,client_time_ms,witness_generation_ms,r1cs_to_qap_ms,witness_share_ms,client_share_serialization_ms,client_to_server_total_payload_bytes,client_to_server_max_share_payload_bytes,mpc_preprocessing_time_ms,mpc_total_time_ms,mpc_server_to_server_total_payload_bytes,mpc_server_to_server_max_sent_payload_bytes,mpc_server_to_server_max_received_payload_bytes,proof_size_bytes,commitment_size_bytes,public_inputs_payload_bytes,server_to_aggregator_cryptographic_payload_bytes,server_to_aggregator_json_artifact_bytes,process_peak_rss_bytes,setup_time_ms" > "$proof_raw_csv"
   for i in $(seq 0 $((NUM_TASKS - 1))); do
     local task_csv="$METRICS_DIR/task_${i}_metrics.csv"
     if [ -f "$task_csv" ]; then
-      echo "$LABEL,$i,${WITNESS_FILES[$i]},$EXPECTED_MATCH,$(get_metric_from_csv "$task_csv" "constraint_count"),$(get_metric_from_csv "$task_csv" "client_total_time_ms"),$(get_metric_from_csv "$task_csv" "proof_size_bytes"),$(get_metric_from_csv "$task_csv" "commitment_size_bytes"),$(get_metric_from_csv "$task_csv" "circuit_building_ms"),$(get_metric_from_csv "$task_csv" "mpc_preprocessing_ms")" >> "$proof_raw_csv"
+      echo "$LABEL,$i,${WITNESS_FILES[$i]},$EXPECTED_MATCH,$(get_metric_from_csv "$task_csv" "constraint_count"),$(get_metric_from_csv "$task_csv" "client_total_time_ms"),$(get_metric_from_csv "$task_csv" "witness_generation_ms"),$(get_metric_from_csv "$task_csv" "r1cs_to_qap_ms"),$(get_metric_from_csv "$task_csv" "witness_secret_sharing_ms"),$(get_metric_from_csv "$task_csv" "client_share_serialization_ms"),$(get_metric_from_csv "$task_csv" "client_to_server_total_payload_bytes"),$(get_metric_from_csv "$task_csv" "client_to_server_max_share_payload_bytes"),$(get_metric_from_csv "$task_csv" "mpc_preprocessing_ms"),$(get_metric_from_csv "$task_csv" "mpc_total_time_ms"),$(get_metric_from_csv "$task_csv" "mpc_server_to_server_total_payload_bytes"),$(get_metric_from_csv "$task_csv" "mpc_server_to_server_max_sent_payload_bytes"),$(get_metric_from_csv "$task_csv" "mpc_server_to_server_max_received_payload_bytes"),$(get_metric_from_csv "$task_csv" "proof_size_bytes"),$(get_metric_from_csv "$task_csv" "commitment_size_bytes"),$(get_metric_from_csv "$task_csv" "public_inputs_payload_bytes"),$(get_metric_from_csv "$task_csv" "server_to_aggregator_cryptographic_payload_bytes"),$(get_metric_from_csv "$task_csv" "server_to_aggregator_json_artifact_bytes"),$(get_metric_from_csv "$task_csv" "process_peak_rss_bytes"),$(get_metric_from_csv "$task_csv" "circuit_building_ms")" >> "$proof_raw_csv"
     fi
   done
 
-  echo "label,run_id,num_proofs,aggregation_setup_time_ms,batch_verify_time_ms,aggregation_total_ms,aggregate_proof_size_bytes,compression_ratio" > "$aggregation_raw_csv"
+  echo "label,run_id,num_proofs,aggregation_setup_time_ms,individual_verify_total_ms,individual_verify_avg_ms,batch_verify_time_ms,batch_verify_amortized_per_proof_ms,aggregation_total_ms,aggregate_proof_size_bytes,aggregator_input_json_bytes,public_inputs_payload_bytes,aggregator_to_verifier_payload_bytes,process_peak_rss_bytes,compression_ratio" > "$aggregation_raw_csv"
   if [ "${SKIP_AGGREGATION:-0}" != "1" ]; then
     for i in $(seq 1 "$AGGREGATION_REPEATS"); do
       local agg_csv="$METRICS_DIR/aggregation_run_${i}_metrics.csv"
       if [ -f "$agg_csv" ]; then
-        echo "$LABEL,$i,$(get_metric_from_csv "$agg_csv" "num_proofs_input"),$(get_metric_from_csv "$agg_csv" "srs_setup_ms"),$(get_metric_from_csv "$agg_csv" "aggregate_verification_ms"),$(get_metric_from_csv "$agg_csv" "aggregation_total_ms"),$(get_metric_from_csv "$agg_csv" "aggregate_proof_size_bytes"),$(get_metric_from_csv "$agg_csv" "compression_ratio")" >> "$aggregation_raw_csv"
+        echo "$LABEL,$i,$(get_metric_from_csv "$agg_csv" "num_proofs_input"),$(get_metric_from_csv "$agg_csv" "srs_setup_ms"),$(get_metric_from_csv "$agg_csv" "individual_verification_total_ms"),$(get_metric_from_csv "$agg_csv" "individual_verification_avg_ms"),$(get_metric_from_csv "$agg_csv" "aggregate_verification_ms"),$(get_metric_from_csv "$agg_csv" "batch_verify_amortized_per_proof_ms"),$(get_metric_from_csv "$agg_csv" "aggregation_total_ms"),$(get_metric_from_csv "$agg_csv" "aggregate_proof_size_bytes"),$(get_metric_from_csv "$agg_csv" "aggregator_input_json_bytes"),$(get_metric_from_csv "$agg_csv" "public_inputs_payload_bytes"),$(get_metric_from_csv "$agg_csv" "aggregator_to_verifier_payload_bytes"),$(get_metric_from_csv "$agg_csv" "process_peak_rss_bytes"),$(get_metric_from_csv "$agg_csv" "compression_ratio")" >> "$aggregation_raw_csv"
       fi
     done
   fi
@@ -312,10 +330,10 @@ generate_benchmark_csvs() {
       proof_count += 1
       constraints = $5
       client += $6
-      proof_size += $7
-      commitment_size += $8
-      if (proof_count == 1) setup_once = $9
-      mpc_preprocessing += $10
+      proof_size += $18
+      commitment_size += $19
+      if (proof_count == 1) setup_once = $24
+      mpc_preprocessing += $13
     }
     END {
       if (proof_count == 0) proof_count = 1
@@ -337,10 +355,10 @@ generate_benchmark_csvs() {
     {
       agg_count += 1
       agg_setup += $4
-      batch_verify += $5
-      agg_total += $6
-      agg_proof_size += $7
-      compression += $8
+      batch_verify += $7
+      agg_total += $9
+      agg_proof_size += $10
+      compression += $15
     }
     END {
       if (agg_count == 0) {

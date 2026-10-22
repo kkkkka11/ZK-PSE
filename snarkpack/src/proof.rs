@@ -144,12 +144,12 @@ impl<E: Pairing> CanonicalSerialize for GipaProof<E> {
                     + self.z_ab[0].0.serialized_size(compress)
                     + self.z_ab[0].1.serialized_size(compress)
                     + self.z_c[0].0.serialized_size(compress)
-                    + self.z_c[0].1.serialized_size(compress)
-                    + self.final_a.serialized_size(compress)
-                    + self.final_b.serialized_size(compress)
-                    + self.final_c.serialized_size(compress)
-                    + self.final_vkey.serialized_size(compress)
-                    + self.final_wkey.serialized_size(compress))
+                    + self.z_c[0].1.serialized_size(compress))
+            + self.final_a.serialized_size(compress)
+            + self.final_b.serialized_size(compress)
+            + self.final_c.serialized_size(compress)
+            + self.final_vkey.serialized_size(compress)
+            + self.final_wkey.serialized_size(compress)
     }
     fn serialize_with_mode<W: Write>(
         &self,
@@ -403,6 +403,17 @@ mod tests {
         proof.write(&mut buffer).unwrap();
         let out = AggregateProof::<Bls12>::read(std::io::Cursor::new(&buffer)).unwrap();
         assert_eq!(proof, out);
+    }
+
+    #[test]
+    fn test_serialized_size_matches_output_length() {
+        let proof = fake_proof();
+
+        for compress in [Compress::Yes, Compress::No] {
+            let mut buffer = Vec::new();
+            proof.serialize_with_mode(&mut buffer, compress).unwrap();
+            assert_eq!(proof.serialized_size(compress), buffer.len());
+        }
     }
 
     #[test]

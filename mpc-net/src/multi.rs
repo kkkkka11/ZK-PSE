@@ -3,6 +3,7 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream,
@@ -100,12 +101,57 @@ pub async fn multiplex_stream<
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
+pub(crate) struct NetworkByteCounters {
+    sent: Vec<AtomicU64>,
+    received: Vec<AtomicU64>,
+}
+
+impl NetworkByteCounters {
+    pub(crate) fn new(n_parties: usize) -> Self {
+        Self {
+            sent: (0..n_parties).map(|_| AtomicU64::new(0)).collect(),
+            received: (0..n_parties).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn snapshot(&self) -> MpcCommunicationStats {
+        let per_party_sent_payload_bytes = self.sent.iter().map(|counter| counter.load(Ordering::Relaxed)).collect::<Vec<_>>();
+        let per_party_received_payload_bytes = self.received.iter().map(|counter| counter.load(Ordering::Relaxed)).collect::<Vec<_>>();
+        MpcCommunicationStats {
+            total_sent_payload_bytes: per_party_sent_payload_bytes.iter().sum(),
+            total_received_payload_bytes: per_party_received_payload_bytes.iter().sum(),
+            max_party_sent_payload_bytes: per_party_sent_payload_bytes.iter().copied().max().unwrap_or(0),
+            max_party_received_payload_bytes: per_party_received_payload_bytes.iter().copied().max().unwrap_or(0),
+            per_party_sent_payload_bytes,
+            per_party_received_payload_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MpcCommunicationStats {
+    pub total_sent_payload_bytes: u64,
+    pub total_received_payload_bytes: u64,
+    pub max_party_sent_payload_bytes: u64,
+    pub max_party_received_payload_bytes: u64,
+    pub per_party_sent_payload_bytes: Vec<u64>,
+    pub per_party_received_payload_bytes: Vec<u64>,
+}
+
+#[derive(Debug)]
 pub struct MpcNetConnection<IO: AsyncRead + AsyncWrite + Unpin> {
     pub id: u32,
     pub listener: Option<TcpListener>,
     pub peers: HashMap<u32, Peer<IO>>,
     pub n_parties: usize,
+    pub(crate) byte_counters: Arc<NetworkByteCounters>,
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin> MpcNetConnection<IO> {
+    pub fn communication_stats(&self) -> MpcCommunicationStats {
+        self.byte_counters.snapshot()
+    }
 }
 
 impl MpcNetConnection<TcpStream> {
@@ -253,12 +299,14 @@ fn dummy_peer_addr() -> SocketAddr {
 fn new_connection<IO: AsyncRead + AsyncWrite + Unpin>(
     party_id: usize,
     n_parties: usize,
+    byte_counters: Arc<NetworkByteCounters>,
 ) -> MpcNetConnection<IO> {
     let mut connection = MpcNetConnection {
         id: party_id as u32,
         listener: None,
         peers: Default::default(),
         n_parties,
+        byte_counters,
     };
 
     for peer_id in 0..n_parties {
@@ -279,11 +327,12 @@ impl InMemoryTestNet {
     pub async fn new_local_testnet(
         n_parties: usize,
     ) -> Result<Self, MpcNetError> {
+        let byte_counters = Arc::new(NetworkByteCounters::new(n_parties));
         let mut nodes = (0..n_parties)
             .map(|party_id| {
                 (
                     party_id,
-                    new_connection::<DuplexStream>(party_id, n_parties),
+                    new_connection::<DuplexStream>(party_id, n_parties, byte_counters.clone()),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -352,6 +401,7 @@ impl LocalTestNet {
         n_parties: usize,
     ) -> Result<Self, MpcNetError> {
         // Step 1: Generate all the Listeners for each node
+        let byte_counters = Arc::new(NetworkByteCounters::new(n_parties));
         let mut listeners = HashMap::new();
         let mut listen_addrs = HashMap::new();
         for party_id in 0..n_parties {
@@ -368,6 +418,7 @@ impl LocalTestNet {
                 listener: Some(my_listener),
                 peers: Default::default(),
                 n_parties,
+                byte_counters: byte_counters.clone(),
             };
             for peer_id in 0..n_parties {
                 // NOTE: this is the listen addr
@@ -506,7 +557,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send> MpcNet
         let peer = self.peers.get(&id).ok_or_else(|| {
             MpcNetError::Generic(format!("Peer {} not found", id))
         })?;
-        recv_stream(peer.streams.as_ref(), sid).await
+        let bytes = recv_stream(peer.streams.as_ref(), sid).await?;
+        self.byte_counters.received[self.id as usize].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(bytes)
     }
 
     async fn send_to(
@@ -518,7 +571,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send> MpcNet
         let peer = self.peers.get(&id).ok_or_else(|| {
             MpcNetError::Generic(format!("Peer {} not found", id))
         })?;
-        send_stream(peer.streams.as_ref(), bytes, sid).await
+        let byte_len = bytes.len() as u64;
+        send_stream(peer.streams.as_ref(), bytes, sid).await?;
+        self.byte_counters.sent[self.id as usize].fetch_add(byte_len, Ordering::Relaxed);
+        Ok(())
     }
 }
 

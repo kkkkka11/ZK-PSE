@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # ARK Libraries
-ark-std = {version = "0.4.0", default-features = false, features = [ "print-trace", "std" ]}
+ark-std = {version = "0.4.0", default-features = false, features = [ "std" ]}
 ark-crypto-primitives = {version = "0.4.0", default-features = false}
 ark-ff = {version = "0.4.2", default-features = false}
 ark-poly = {version = "0.4.0", default-features = false}
@@ -52,11 +52,22 @@ serde_cbor = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 
 [features]
-parallel = ["ark-std/parallel", "rayon"]
-
+parallel = [
+    "ark-std/parallel",
+    "ark-ff/parallel",
+    "ark-poly/parallel",
+    "ark-ec/parallel",
+    "dist-primitives/parallel",
+    "secret-sharing/parallel",
+    "rayon",
+]
 [[example]]
 name = "regex"  
 path = "examples/regex.rs"
+
+[[example]]
+name = "password_policy_arkworks_benchmark"
+path = "examples/password_policy_arkworks_benchmark.rs"
 
 [[bin]]
 name = "aggregation_server"  

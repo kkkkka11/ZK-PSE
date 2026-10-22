@@ -1,5 +1,5 @@
 use crate::multi::{
-    multiplex_stream, MpcNetConnection, Peer, WrappedMuxStream,
+    multiplex_stream, MpcNetConnection, NetworkByteCounters, Peer, WrappedMuxStream,
     MULTIPLEXED_STREAMS,
 };
 use crate::{MpcNet, MpcNetError, MultiplexedStreamID};
@@ -203,6 +203,7 @@ impl<T: IOStream> ProdNet<T> {
             listener: None,
             peers: Default::default(),
             n_parties,
+            byte_counters: Arc::new(NetworkByteCounters::new(n_parties)),
         };
 
         if id == 0 {

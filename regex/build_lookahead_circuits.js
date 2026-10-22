@@ -5,8 +5,24 @@ const path = require("path");
 const { execSync } = require("child_process");
 
 const DEFAULT_MSG_BYTES = 20;
+const VENDORED_ZK_REGEX_ROOT = path.join(__dirname, "zk-regex-compiler-v2");
+const VENDORED_ZK_REGEX_BIN = path.join(VENDORED_ZK_REGEX_ROOT, "target/release/zk-regex");
 const LOCAL_ZK_REGEX_BIN = path.join(__dirname, "target/release/zk-regex");
-const ZK_REGEX_BIN = process.env.ZK_REGEX_BIN || (fs.existsSync(LOCAL_ZK_REGEX_BIN) ? LOCAL_ZK_REGEX_BIN : "zk-regex");
+
+function resolveZkRegexBin() {
+    if (process.env.ZK_REGEX_BIN) {
+        return process.env.ZK_REGEX_BIN;
+    }
+    if (fs.existsSync(VENDORED_ZK_REGEX_BIN)) {
+        return VENDORED_ZK_REGEX_BIN;
+    }
+    if (fs.existsSync(path.join(VENDORED_ZK_REGEX_ROOT, "Cargo.toml"))) {
+        throw new Error(`Patched zk-regex compiler is present but not built. Run: cargo build --release -p zk-regex-compiler --bin zk-regex --manifest-path ${path.join(VENDORED_ZK_REGEX_ROOT, "Cargo.toml")}`);
+    }
+    return fs.existsSync(LOCAL_ZK_REGEX_BIN) ? LOCAL_ZK_REGEX_BIN : "zk-regex";
+}
+
+let ZK_REGEX_BIN;
 
 function usage() {
     console.log(`Usage:
@@ -36,8 +52,9 @@ This generator lowers password-policy lookaheads into independent zk-regex
 subcircuits and combines their boolean outputs in a wrapper circuit.
 
 Environment:
-  ZK_REGEX_BIN  Path to a zk-regex binary that supports --shared-input.
-                Defaults to zk-regex from PATH.`);
+  ZK_REGEX_BIN  Path to a zk-regex binary. By default, this script uses the
+                patched vendored v2 compiler under regex/zk-regex-compiler-v2.
+                Shared-input circuits are produced by deterministic post-processing.`);
 }
 
 function run(command, options = {}) {
@@ -346,6 +363,28 @@ function repairGeneratedCircom(circomPath) {
     throw new Error(`Generated Circom has unbalanced braces: ${circomPath}`);
 }
 
+
+function convertGeneratedCircomToSharedInput(circomPath) {
+    const content = fs.readFileSync(circomPath, "utf8");
+    const inputBlock = /\n\s*signal input msg\[msg_bytes\];\n\s*signal output out;\n\n\s*var num_bytes = msg_bytes\+1;\n\s*signal in\[num_bytes\];\n\s*signal in_range_checks\[msg_bytes\];\n\s*in\[0\]\s*<==\s*255;\n\s*for \(var i = 0; i < msg_bytes; i\+\+\) \{\n\s*in_range_checks\[i\]\s*<==\s*LessThan\(8\)\(\[msg\[i\], 255\]\);\n\s*in_range_checks\[i\]\s*===\s*1;\n\s*in\[i\+1\]\s*<==\s*msg\[i\];\n\s*\}\n/;
+    const replacement = `
+\tsignal input in[msg_bytes+1];
+\tsignal output out;
+
+\tvar num_bytes = msg_bytes+1;
+`;
+    const updated = content.replace(inputBlock, replacement);
+
+    if (updated === content) {
+        throw new Error(`Failed to convert generated DFA to shared-input interface: ${circomPath}`);
+    }
+    if (updated.includes("signal input msg[msg_bytes]") || updated.includes("in_range_checks")) {
+        throw new Error(`Shared-input conversion left duplicated input checks in: ${circomPath}`);
+    }
+
+    fs.writeFileSync(circomPath, updated);
+}
+
 function generateSubCircuit(condition, index, ruleDir, options) {
     const templateName = `RuleCond${index}`;
     const baseName = `cond_${String(index).padStart(2, "0")}_${sanitizeName(condition.regex).slice(0, 48)}`;
@@ -354,12 +393,15 @@ function generateSubCircuit(condition, index, ruleDir, options) {
 
     writeRegexJson(jsonPath, condition.regex);
     const genSubstrs = options.genSubstrs ? "true" : "false";
-    const sharedInputArg = options.sharedInput ? " --shared-input true" : "";
     run(
-        `${JSON.stringify(ZK_REGEX_BIN)} decomposed -d ${JSON.stringify(jsonPath)} -c ${JSON.stringify(circomPath)} -t ${templateName} -g ${genSubstrs}${sharedInputArg}`,
+        `${JSON.stringify(ZK_REGEX_BIN)} decomposed -d ${JSON.stringify(jsonPath)} -c ${JSON.stringify(circomPath)} -t ${templateName} -g ${genSubstrs}`,
         options
     );
     repairGeneratedCircom(circomPath);
+    if (options.sharedInput) {
+        convertGeneratedCircomToSharedInput(circomPath);
+        repairGeneratedCircom(circomPath);
+    }
 
     return {
         ...condition,
@@ -370,23 +412,28 @@ function generateSubCircuit(condition, index, ruleDir, options) {
 }
 
 function passwordHashTemplate() {
-    return `template PasswordHash20() {
+    return `template PasswordHash20Salt20() {
     signal input msg[20];
-    signal input k;
+    signal input salt[20];
     signal output hash;
 
-    component left_hasher = Poseidon(10);
-    component right_hasher = Poseidon(10);
-    component final_hasher = Poseidon(3);
+    component msg_left_hasher = Poseidon(10);
+    component msg_right_hasher = Poseidon(10);
+    component salt_left_hasher = Poseidon(10);
+    component salt_right_hasher = Poseidon(10);
+    component final_hasher = Poseidon(4);
 
     for (var i = 0; i < 10; i++) {
-        left_hasher.inputs[i] <== msg[i];
-        right_hasher.inputs[i] <== msg[i + 10];
+        msg_left_hasher.inputs[i] <== msg[i];
+        msg_right_hasher.inputs[i] <== msg[i + 10];
+        salt_left_hasher.inputs[i] <== salt[i];
+        salt_right_hasher.inputs[i] <== salt[i + 10];
     }
 
-    final_hasher.inputs[0] <== k;
-    final_hasher.inputs[1] <== left_hasher.out;
-    final_hasher.inputs[2] <== right_hasher.out;
+    final_hasher.inputs[0] <== msg_left_hasher.out;
+    final_hasher.inputs[1] <== msg_right_hasher.out;
+    final_hasher.inputs[2] <== salt_left_hasher.out;
+    final_hasher.inputs[3] <== salt_right_hasher.out;
 
     hash <== final_hasher.out;
 }`;
@@ -470,20 +517,28 @@ ${passwordHashTemplate()}
 
 template ${wrapperName}(maxLength) {
     signal input msg[maxLength];
-    signal input k;
+    signal input salt[20];
     signal input expected_match;
     signal output hash;
     signal output regex_match;
+    signal salt_range_checks[20];
+
+    for (var s = 0; s < 20; s++) {
+        salt_range_checks[s] <== LessThan(9)([salt[s], 256]);
+        salt_range_checks[s] === 1;
+    }
 
 ${sharedInputSnippet}
 
 ${combineConditionsSnippet(conditions, options)}
 
-    component password_hash = PasswordHash20();
+    component password_hash = PasswordHash20Salt20();
     for (var i = 0; i < maxLength; i++) {
         password_hash.msg[i] <== msg[i];
     }
-    password_hash.k <== k;
+    for (var s = 0; s < 20; s++) {
+        password_hash.salt[s] <== salt[s];
+    }
     hash <== password_hash.hash;
 
     expected_match * (expected_match - 1) === 0;
@@ -529,6 +584,8 @@ function buildRule(rule, outputDir, options) {
                 id: rule.id,
                 source_regex: rule.regex,
                 msg_bytes: DEFAULT_MSG_BYTES,
+                salt_bytes: 20,
+                salt_encoding: "hex",
                 dot_mode: options.dot,
                 shared_input: options.sharedInput,
                 gen_substrs: options.genSubstrs,
@@ -555,6 +612,8 @@ function main() {
         usage();
         return;
     }
+
+    ZK_REGEX_BIN = resolveZkRegexBin();
 
     const positionals = positionalArgs(args);
     const inputPath = path.resolve(positionals[0]);

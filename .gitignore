@@ -23,6 +23,14 @@ logs/
 logs_*/
 *.log
 results/
+/benchmark_results/
+/diagnostics/
+/experiments/
+/fixtures/smoke_policy/
+
+# Local Python caches
+__pycache__/
+*.pyc
 
 # OS/editor noise
 .DS_Store
