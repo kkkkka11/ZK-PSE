@@ -56,12 +56,12 @@ node regex/build_lookahead_circuits.js regex/password_policies_5.txt fixtures/pa
   --dot ascii
 ```
 
-`G16-SI` uses shared input checks and disables substring/reveal helper logic.
+`G16-Optimized` uses shared input checks and disables substring/reveal helper logic.
 `G16-Base` uses separate input checks in each DFA and enables substring/reveal
 helpers (`--gen-substrs`). Both use the same patched compiler, policies, and
 Poseidon password/salt commitment. This comparison includes both optimizations.
 
-## G16-SI / G16-Base Comparison
+## G16-Optimized / G16-Base Comparison
 
 After generating both circuit sets above, run the single-prover Groth16 benchmark:
 
@@ -76,7 +76,8 @@ This evaluates all five policies with the checked-in good and bad witnesses.
 The output contains `setup_raw.csv`, `proof_raw.csv`, and `summary.csv` with
 constraint counts, setup/proving/verification times, compressed proof sizes,
 and success/failure counts. Setup and witness generation are outside the proof
-timer. Use `--regex-id`, `--variant`, or `--help` to select a smaller run.
+timer. Use `--variant G16-Optimized` or `--variant G16-Base` to run one
+configuration, and `--regex-id` to select a policy.
 Timing results depend on hardware and thread settings.
 
 ## Build

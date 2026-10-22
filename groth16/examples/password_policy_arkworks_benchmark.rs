@@ -107,7 +107,7 @@ fn usage(program: &str) {
         "Usage: {program} [options]\n\
          \n\
          Options:\n\
-           --variant <name>       all (default), G16-SI, or G16-Base\n\
+           --variant <name>       all (default), G16-Optimized, or G16-Base\n\
            --optimized <dir>      Default: fixtures/password_policies_5_ascii\n\
            --noshare <dir>        Default: fixtures/password_policies_5_ascii_noshare\n\
            --good <dir>           Default: fixtures/regex/witness-good\n\
@@ -118,7 +118,7 @@ fn usage(program: &str) {
            --regex-id <n>         Run only one regex (for example, 1 or 3)\n\
            --max-tasks <n>        Witnesses per good/bad case. Default: all\n\
            --case <name>          all (default), good, or bad\n\
-           --reverse-circuit-order Run G16-Base before G16-SI for order-control tests\n\
+           --reverse-circuit-order Run G16-Base before G16-Optimized for order-control tests\n\
            --out <dir>            Default: benchmark_results/g16_baselines\n"
     );
 }
@@ -209,8 +209,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         }
     }
 
-    if !matches!(args.variant.as_str(), "all" | "G16-SI" | "G16-Base") {
-        return Err("--variant must be all, G16-SI, or G16-Base".into());
+    if !matches!(args.variant.as_str(), "all" | "G16-Optimized" | "G16-Base") {
+        return Err("--variant must be all, G16-Optimized, or G16-Base".into());
     }
     if !matches!(args.case_filter.as_str(), "all" | "good" | "bad") {
         return Err("--case must be all, good, or bad".into());
@@ -684,10 +684,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let sample_good = read_witness(&good_witnesses[0])?;
     let mut circuit_sets = match args.variant.as_str() {
-        "G16-SI" => vec![("G16-SI", args.optimized_dir.clone())],
+        "G16-Optimized" => vec![("G16-Optimized", args.optimized_dir.clone())],
         "G16-Base" => vec![("G16-Base", args.noshare_dir.clone())],
         _ => vec![
-            ("G16-SI", args.optimized_dir.clone()),
+            ("G16-Optimized", args.optimized_dir.clone()),
             ("G16-Base", args.noshare_dir.clone()),
         ],
     };

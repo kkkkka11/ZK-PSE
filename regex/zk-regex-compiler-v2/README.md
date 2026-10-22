@@ -22,6 +22,6 @@ in `LICENSE`; the original package metadata is preserved.
 
 `--shared-input` is an option of the ZK-PSE JavaScript generator, not of this
 compiler CLI. The generator converts the emitted DFA inputs to a shared interface
-and places the input checks in the wrapper circuit. Both G16-SI and G16-Base use
+and places the input checks in the wrapper circuit. Both G16-Optimized and G16-Base use
 this same patched compiler; they differ in the generator options documented in
 the root README.
