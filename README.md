@@ -75,14 +75,8 @@ RAYON_NUM_THREADS=1 ./target/release/examples/password_policy_arkworks_benchmark
 This evaluates all five policies with the checked-in good and bad witnesses.
 The output contains `setup_raw.csv`, `proof_raw.csv`, and `summary.csv` with
 constraint counts, setup/proving/verification times, compressed proof sizes,
-and success/failure counts. For Client Time, use `total_proving_time_ms`
-(`total_proving_time_ms_avg` in `summary.csv`): it adds measured witness
-generation to the pure Groth16 `prove_time_ms`. Witness timing includes input
-preparation, witness generation, and public input extraction. Setup, witness
-file loading, verification, and proof serialization are separate. Summary
-averages include successful proofs only. Older results without witness timing
-must be rerun to obtain this total.
-Use `--variant G16-Enhanced` or `--variant G16-Base` to run one
+and success/failure counts. Setup and witness generation are outside the proof
+timer. Use `--variant G16-Enhanced` or `--variant G16-Base` to run one
 configuration, and `--regex-id` to select a policy.
 Timing results depend on hardware and thread settings.
 
@@ -105,30 +99,6 @@ Witnesses are in `fixtures/regex/witness-good` and `witness-bad`; `k` is a
 40-character hexadecimal salt. Good/bad runs prove policy outputs 1/0 respectively.
 Task and aggregation metrics are written under `logs/metrics/`; each run also
 archives its logs and proofs under `logs_1_good/` / `proof_data_1_good/` (or `1_bad`).
-
-Current task records use `timing_scope_version=2`. Client Time includes
-witness preparation, QAP evaluation, and both assignment and QAP sharing.
-`qap_sharing_ms` is included once in `client_total_time_ms`;
-`mpc_preprocessing_ms` directly measures offline preparation without QAP
-sharing. Do not subtract QAP sharing from this offline field again.
-
-`online_computation_ms` starts when all input shares and offline materials are
-ready and ends when a complete Groth16 proof has been constructed. It includes
-local dispatch/copies, MPC communication and synchronization, and proof
-reconstruction. Client preparation, offline preparation, proof verification,
-serialization, and aggregation are outside this server interval. The older
-`mpc_total_time_ms` remains a narrower slowest-party measurement.
-
-For repeatable five-round runs and scope-checked summaries, use:
-
-```bash
-REGEX_IDS='1 2 3 4 5' bash scripts/run_online_computation_5rounds.sh experiments/timing_scope_v2
-python3 scripts/summarize_online_computation.py experiments/timing_scope_v2
-```
-
-The launcher freezes its executables and rejects changed resume inputs. See
-[measurement boundaries and reproduction](docs/measurement.md) for units,
-thread settings, legacy-record handling, and regression checks.
 
 Proof only:
 
