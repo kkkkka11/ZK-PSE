@@ -75,8 +75,14 @@ RAYON_NUM_THREADS=1 ./target/release/examples/password_policy_arkworks_benchmark
 This evaluates all five policies with the checked-in good and bad witnesses.
 The output contains `setup_raw.csv`, `proof_raw.csv`, and `summary.csv` with
 constraint counts, setup/proving/verification times, compressed proof sizes,
-and success/failure counts. Setup and witness generation are outside the proof
-timer. Use `--variant G16-Enhanced` or `--variant G16-Base` to run one
+and success/failure counts. For Client Time, use `total_proving_time_ms`
+(`total_proving_time_ms_avg` in `summary.csv`): it adds measured witness
+generation to the pure Groth16 `prove_time_ms`. Witness timing includes input
+preparation, witness generation, and public input extraction. Setup, witness
+file loading, verification, and proof serialization are separate. Summary
+averages include successful proofs only. Older results without witness timing
+must be rerun to obtain this total.
+Use `--variant G16-Enhanced` or `--variant G16-Base` to run one
 configuration, and `--regex-id` to select a policy.
 Timing results depend on hardware and thread settings.
 

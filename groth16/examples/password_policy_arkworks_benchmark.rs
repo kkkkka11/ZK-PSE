@@ -67,6 +67,8 @@ struct ProofRawRow {
     commitment_size_bytes: usize,
     status: String,
     error: String,
+    witness_generation_ms: f64,
+    total_proving_time_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +86,8 @@ struct SummaryRow {
     setup_fail_count: usize,
     proof_success_count: usize,
     proof_fail_count: usize,
+    witness_generation_ms_avg: f64,
+    total_proving_time_ms_avg: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -414,13 +418,15 @@ fn run_proof_once(
     witness: &Witness,
     expected_match: u8,
     rng: &mut StdRng,
-) -> Result<(f64, f64, usize), Box<dyn std::error::Error>> {
+) -> Result<(f64, f64, f64, usize), Box<dyn std::error::Error>> {
+    let witness_start = Instant::now();
     let mut builder = CircomBuilder::new(cfg.clone());
     push_inputs(&mut builder, witness, expected_match)?;
     let circom = builder.build()?;
     let public_inputs = circom
         .get_public_inputs()
         .ok_or("Failed to get public inputs")?;
+    let witness_generation_ms = witness_start.elapsed().as_secs_f64() * 1000.0;
 
     let prove_start = Instant::now();
     let proof = Groth16::<Bn254, CircomReduction>::prove(pk, circom, rng)?;
@@ -441,7 +447,7 @@ fn run_proof_once(
 
     let mut proof_bytes = Vec::new();
     proof.serialize_with_mode(&mut proof_bytes, Compress::Yes)?;
-    Ok((prove_time_ms, verify_time_ms, proof_bytes.len()))
+    Ok((witness_generation_ms, prove_time_ms, verify_time_ms, proof_bytes.len()))
 }
 
 fn record_proof(
@@ -467,7 +473,7 @@ fn record_proof(
     });
 
     match result {
-        Ok((prove_time_ms, verify_time_ms, proof_size_bytes)) => {
+        Ok((witness_generation_ms, prove_time_ms, verify_time_ms, proof_size_bytes)) => {
             proof_rows.push(ProofRawRow {
                 circuit_set: prepared.circuit_set.clone(),
                 regex_id: prepared.regex_id,
@@ -483,6 +489,8 @@ fn record_proof(
                 commitment_size_bytes: POSEIDON_COMMITMENT_BYTES,
                 status: "ok".to_string(),
                 error: String::new(),
+                witness_generation_ms,
+                total_proving_time_ms: witness_generation_ms + prove_time_ms,
             });
         }
         Err(error) => {
@@ -501,6 +509,8 @@ fn record_proof(
                 commitment_size_bytes: POSEIDON_COMMITMENT_BYTES,
                 status: "error".to_string(),
                 error: error.to_string(),
+                witness_generation_ms: 0.0,
+                total_proving_time_ms: 0.0,
             });
         }
     }
@@ -664,6 +674,12 @@ fn summarize(
                     setup_fail_count,
                     proof_success_count,
                     proof_fail_count,
+                    witness_generation_ms_avg: avg(
+                        &ok.iter().map(|r| r.witness_generation_ms).collect::<Vec<_>>(),
+                    ),
+                    total_proving_time_ms_avg: avg(
+                        &ok.iter().map(|r| r.total_proving_time_ms).collect::<Vec<_>>(),
+                    ),
                 });
             }
         }
