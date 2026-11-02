@@ -183,14 +183,15 @@ struct PerformanceCollector {
     task_id: usize,
     start_time: Instant,
     
-    // 客户端工作时间（保留）
+    // Client preparation, including all witness-dependent QAP sharing.
     witness_generation_time_ms: f64,
     witness_secret_sharing_time_ms: f64,
+    qap_sharing_time_ms: f64,
     client_share_serialization_time_ms: f64,
     client_to_server_total_payload_bytes: u64,
     client_to_server_max_share_payload_bytes: u64,
     
-    // MPC时间（取最慢的那一方）
+    // Offline preprocessing excludes witness-dependent preparation.
     mpc_preprocessing_time_ms: f64,
     mpc_r1cs_to_qap_ms: f64,
     mpc_total_time_ms: f64,           // 最慢方的总MPC时间
@@ -200,6 +201,9 @@ struct PerformanceCollector {
     mpc_b_g2_computation_ms: f64,
     mpc_c_computation_ms: f64,
     mpc_reconstruction_time_ms: f64,
+    // Input-dependent shares and offline materials are ready at this boundary.
+    mpc_execution_time_ms: f64,      // Entire local simulation call, before reconstruction.
+    online_computation_time_ms: f64, // Simulation start through complete Proof construction.
     mpc_server_to_server_total_payload_bytes: u64,
     mpc_server_to_server_max_sent_payload_bytes: u64,
     mpc_server_to_server_max_received_payload_bytes: u64,
@@ -221,6 +225,7 @@ impl PerformanceCollector {
             start_time: Instant::now(),
             witness_generation_time_ms: 0.0,
             witness_secret_sharing_time_ms: 0.0,
+            qap_sharing_time_ms: 0.0,
             client_share_serialization_time_ms: 0.0,
             client_to_server_total_payload_bytes: 0,
             client_to_server_max_share_payload_bytes: 0,
@@ -233,6 +238,8 @@ impl PerformanceCollector {
             mpc_b_g2_computation_ms: 0.0,
             mpc_c_computation_ms: 0.0,
             mpc_reconstruction_time_ms: 0.0,
+            mpc_execution_time_ms: 0.0,
+            online_computation_time_ms: 0.0,
             mpc_server_to_server_total_payload_bytes: 0,
             mpc_server_to_server_max_sent_payload_bytes: 0,
             mpc_server_to_server_max_received_payload_bytes: 0,
@@ -253,6 +260,10 @@ impl PerformanceCollector {
     
     fn record_witness_secret_sharing(&mut self, duration_ms: f64) {
         self.witness_secret_sharing_time_ms = duration_ms;
+    }
+
+    fn record_qap_sharing(&mut self, duration_ms: f64) {
+        self.qap_sharing_time_ms = duration_ms;
     }
     
     fn record_client_share_transport(&mut self, duration_ms: f64, per_server_payload_bytes: &[u64]) {
@@ -292,6 +303,11 @@ impl PerformanceCollector {
     fn record_mpc_reconstruction(&mut self, duration_ms: f64) {
         self.mpc_reconstruction_time_ms = duration_ms;
     }
+
+    fn record_online_computation(&mut self, execution_ms: f64, online_ms: f64) {
+        self.mpc_execution_time_ms = execution_ms;
+        self.online_computation_time_ms = online_ms;
+    }
     
     // 新增：选择最慢方的MPC时间
     fn record_slowest_mpc_metrics(&mut self, all_party_metrics: &[MpcDetailedMetrics]) {
@@ -319,7 +335,11 @@ impl PerformanceCollector {
     }
 
     fn calculate_client_total_time(&self) -> f64 {
-        self.witness_generation_time_ms + self.mpc_r1cs_to_qap_ms + self.witness_secret_sharing_time_ms + self.client_share_serialization_time_ms
+        self.witness_generation_time_ms
+            + self.mpc_r1cs_to_qap_ms
+            + self.witness_secret_sharing_time_ms
+            + self.qap_sharing_time_ms
+            + self.client_share_serialization_time_ms
     }
 
     fn save_metrics(&self, circuit_info: &CircuitInfo, proof_size: usize, commitment_size: u64) {
@@ -372,6 +392,12 @@ impl PerformanceCollector {
             ("public_inputs_count".to_string(), circuit_info.public_inputs_count.to_string()),
             ("qap_size_bytes".to_string(), circuit_info.qap_size_bytes.to_string()),
             ("qap_domain_size".to_string(), circuit_info.qap_domain_size.to_string()),
+            // Append the new scope without changing the legacy MPC metric.
+            ("mpc_execution_ms".to_string(), self.mpc_execution_time_ms.to_string()),
+            ("online_computation_ms".to_string(), self.online_computation_time_ms.to_string()),
+            // Version 2: client includes QAP sharing; preprocessing excludes it.
+            ("timing_scope_version".to_string(), "2".to_string()),
+            ("qap_sharing_ms".to_string(), self.qap_sharing_time_ms.to_string()),
         ];
 
         task_csv.safe_write_metrics(&metrics.iter().map(|(k, v)| (k.as_str(), v.clone())).collect::<Vec<_>>());
@@ -394,7 +420,7 @@ struct MpcDetailedMetrics {
     b_g1_computation_ms: f64,
     b_g2_computation_ms: f64,
     c_computation_ms: f64,
-    total_pure_computation_ms: f64,  // 所有MSM操作的总时间
+    total_pure_computation_ms: f64,  // Legacy name: party elapsed, including communication/waiting.
 }
 
 impl MpcDetailedMetrics {
@@ -906,7 +932,7 @@ where
 
     end_timer!(mpc_section);
     
-    // 计算总的纯计算时间
+    // Party elapsed includes local communication and the completion barrier.
     metrics.total_pure_computation_ms = mpc_section_start.elapsed().as_millis() as f64;
 
     (pi_a_share, pi_b_g2_share, pi_c_share, metrics)
@@ -1167,7 +1193,23 @@ async fn main() {
         circuit_csv.safe_write_metrics(&circuit_metrics.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>());
     }
 
-    // 6. MPC阶段1：预处理
+    // Client input preparation: create QAP shares before the offline timer.
+    let qap_sharing_start = Instant::now();
+    // Enter the existing Rayon pool once: pack() uses parallel FFT iterators,
+    // so invoking every tiny FFT from outside the pool adds scheduling overhead.
+    #[cfg(feature = "parallel")]
+    let qap_shares = rayon::scope(|_| qap.pss(&pp));
+    #[cfg(not(feature = "parallel"))]
+    let qap_shares = qap.pss(&pp);
+    let domain = qap.domain;
+    let qap_shares = Arc::new(qap_shares);
+    drop(qap);
+    drop(matrices);
+    let qap_sharing_ms = qap_sharing_start.elapsed().as_secs_f64() * 1000.0;
+    perf_collector.record_qap_sharing(qap_sharing_ms);
+    println!("  ├─ Client QAP sharing: {:.6}s", qap_sharing_ms / 1000.0);
+
+    // 6. Input-independent offline preparation; QAP sharing is already complete.
     let mpc_preprocessing_start = Instant::now();
     let r = Bn254Fr::rand(rng);
     let s = Bn254Fr::rand(rng);
@@ -1193,14 +1235,6 @@ async fn main() {
     let s_shares = pp.pack(vec![s; pp.n], rng);
     println!(
         "  ├─ Dealer pack s: {:.2}s",
-        dealer_step_start.elapsed().as_secs_f64()
-    );
-    let dealer_step_start = Instant::now();
-    let qap_shares = qap.pss(&pp);
-    drop(qap);
-    drop(matrices);
-    println!(
-        "  ├─ Dealer pack qap: {:.2}s",
         dealer_step_start.elapsed().as_secs_f64()
     );
     //let crs_shares = PackedProvingKeyShare::<Bn254>::pack_from_arkworks_proving_key(&pk, pp);
@@ -1235,12 +1269,10 @@ async fn main() {
     drop(pk);
 
     let crs_shares = Arc::new(crs_shares);
-    let qap_shares = Arc::new(qap_shares);
 
     // 网络创建
     let network = Net::new_local_testnet(pp.n).await.unwrap();
     // 参与方并行工作（masks生成）
-    let domain = qap_shares[0].domain;
     let root_of_unity = {
         let domain_size_double = 2 * domain.size();
         let domain_double = Radix2EvaluationDomain::<Bn254Fr>::new(domain_size_double).unwrap();
@@ -1316,7 +1348,7 @@ async fn main() {
 
     let g2_msm_masks = MsmMask::<G2>::sample(&pp, rng);
 
-    perf_collector.record_mpc_preprocessing(mpc_preprocessing_start.elapsed().as_millis() as f64);
+    perf_collector.record_mpc_preprocessing(mpc_preprocessing_start.elapsed().as_secs_f64() * 1000.0);
 
     // 7. 客户端工作：witness秘密分享
     let client_sharing_start = Instant::now();
@@ -1337,8 +1369,10 @@ async fn main() {
         &per_server_share_payload_bytes,
     );
 
-    // 8. MPC计算：分离纯计算时间和网络开销
-    let mpc_total_start = Instant::now();
+    // 8. Online computation begins with all a/ax and QAP shares, CRS shares,
+    // masks and local channels ready. Count dispatch/copies, execution and
+    // reconstruction; stop before verification, serialization and diagnostics.
+    let online_computation_start = Instant::now();
     let local_completion_barrier = Arc::new(Barrier::new(pp.n));
     let result: Vec<(G1, G2, G1, MpcDetailedMetrics, mpc_net::multi::MpcCommunicationStats)> = network
         .simulate_network_round(
@@ -1388,23 +1422,17 @@ async fn main() {
                 (pi_a_share, pi_b_g2_share, pi_c_share, metrics, communication_stats)
             },
         ).await;
-    // 提取所有参与方的metrics并选择最慢的
-    let all_party_metrics: Vec<MpcDetailedMetrics> = result.iter().map(|(_, _, _, metrics, _)| metrics.clone()).collect();
-    perf_collector.record_slowest_mpc_metrics(&all_party_metrics);
-    if let Some((_, _, _, _, communication_stats)) = result.last() {
-        perf_collector.record_mpc_communication(communication_stats);
-        save_mpc_party_communication(task_id, communication_stats);
-    }
+    let mpc_execution_ms = online_computation_start.elapsed().as_secs_f64() * 1000.0;
 
     // 9. MPC阶段3：重构
     let mpc_reconstruction_start = Instant::now();
     let mut a_shares = Vec::new();
     let mut b_shares = Vec::new();
     let mut c_shares = Vec::new();
-    for (a_share, b_share, c_share, _metrics, _communication_stats) in result.into_iter() {
-        a_shares.push(a_share);
-        b_shares.push(b_share);
-        c_shares.push(c_share);
+    for (a_share, b_share, c_share, _metrics, _communication_stats) in result.iter() {
+        a_shares.push(*a_share);
+        b_shares.push(*b_share);
+        c_shares.push(*c_share);
     }
 
     let a = pp.unpack2(a_shares)[0];
@@ -1416,8 +1444,21 @@ async fn main() {
         b: b.into_affine(),
         c: c.into_affine(),
     };
-    let mpc_reconstruction_time = mpc_reconstruction_start.elapsed().as_millis();
-    perf_collector.record_mpc_reconstruction(mpc_reconstruction_time as f64);
+    let proof_ready_at = Instant::now();
+    let online_computation_ms = proof_ready_at.duration_since(online_computation_start).as_secs_f64() * 1000.0;
+    let mpc_reconstruction_ms = proof_ready_at.duration_since(mpc_reconstruction_start).as_secs_f64() * 1000.0;
+    perf_collector.record_online_computation(mpc_execution_ms, online_computation_ms);
+    perf_collector.record_mpc_reconstruction(mpc_reconstruction_ms);
+
+    // Collect/export diagnostics after the online endpoint. The result contains
+    // only proof shares/metrics here; all large simulation inputs have returned.
+    let all_party_metrics: Vec<MpcDetailedMetrics> = result.iter().map(|(_, _, _, metrics, _)| metrics.clone()).collect();
+    perf_collector.record_slowest_mpc_metrics(&all_party_metrics);
+    if let Some((_, _, _, _, communication_stats)) = result.last() {
+        perf_collector.record_mpc_communication(communication_stats);
+        save_mpc_party_communication(task_id, communication_stats);
+    }
+    drop(result);
 
     // 10. 验证证明
     let mpc_verify_start = Instant::now();
@@ -1507,7 +1548,8 @@ async fn main() {
     println!("📊 Performance Summary:");
     println!("  ├─ Witness generation: {:.2} ms", perf_collector.witness_generation_time_ms);
     println!("  ├─ Circuit building: {:.2} ms", perf_collector.circuit_building_time_ms);
-    println!("  ├─ MPC preprocessing: {:.2} ms", perf_collector.mpc_preprocessing_time_ms);
+    println!("  ├─ Offline preprocessing (excludes QAP sharing): {:.3} ms", perf_collector.mpc_preprocessing_time_ms);
+    println!("  ├─ Client QAP sharing: {:.3} ms", perf_collector.qap_sharing_time_ms);
     println!("  ├─ witness_secret_sharing: {:.2} ms", perf_collector.witness_secret_sharing_time_ms);
     println!("  ├─ MPC R1CS to QAP: {:.2} ms", perf_collector.mpc_r1cs_to_qap_ms);
     println!("  ├─ MPC computation (slowest party): {:.2} ms", perf_collector.mpc_total_time_ms);
@@ -1517,5 +1559,7 @@ async fn main() {
     println!("  │   ├─ B(G2) computation: {:.2} ms", perf_collector.mpc_b_g2_computation_ms);
     println!("  │   └─ C computation: {:.2} ms", perf_collector.mpc_c_computation_ms);
     println!("  ├─ MPC reconstruction: {:.2} ms", perf_collector.mpc_reconstruction_time_ms);
+    println!("  ├─ MPC execution (full simulation call): {:.3} ms", perf_collector.mpc_execution_time_ms);
+    println!("  ├─ Online computation (shares ready to complete proof): {:.3} ms", perf_collector.online_computation_time_ms);
     println!("  └─ Client total: {:.2} ms", perf_collector.calculate_client_total_time());
 }

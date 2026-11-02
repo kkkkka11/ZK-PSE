@@ -106,6 +106,30 @@ Witnesses are in `fixtures/regex/witness-good` and `witness-bad`; `k` is a
 Task and aggregation metrics are written under `logs/metrics/`; each run also
 archives its logs and proofs under `logs_1_good/` / `proof_data_1_good/` (or `1_bad`).
 
+Current task records use `timing_scope_version=2`. Client Time includes
+witness preparation, QAP evaluation, and both assignment and QAP sharing.
+`qap_sharing_ms` is included once in `client_total_time_ms`;
+`mpc_preprocessing_ms` directly measures offline preparation without QAP
+sharing. Do not subtract QAP sharing from this offline field again.
+
+`online_computation_ms` starts when all input shares and offline materials are
+ready and ends when a complete Groth16 proof has been constructed. It includes
+local dispatch/copies, MPC communication and synchronization, and proof
+reconstruction. Client preparation, offline preparation, proof verification,
+serialization, and aggregation are outside this server interval. The older
+`mpc_total_time_ms` remains a narrower slowest-party measurement.
+
+For repeatable five-round runs and scope-checked summaries, use:
+
+```bash
+REGEX_IDS='1 2 3 4 5' bash scripts/run_online_computation_5rounds.sh experiments/timing_scope_v2
+python3 scripts/summarize_online_computation.py experiments/timing_scope_v2
+```
+
+The launcher freezes its executables and rejects changed resume inputs. See
+[measurement boundaries and reproduction](docs/measurement.md) for units,
+thread settings, legacy-record handling, and regression checks.
+
 Proof only:
 
 ```bash

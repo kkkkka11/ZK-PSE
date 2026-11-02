@@ -36,13 +36,20 @@ log_status() {
 get_metric_from_csv() {
   local csv_file="$1"
   local metric_name="$2"
+  local missing_value="${3-0}"
 
   if [ -f "$csv_file" ]; then
     local value
-    value="$(awk -F, -v key="$metric_name" '$1 == key { print $2; exit }' "$csv_file")"
-    echo "${value:-0}"
+    # A resumed task may append a complete record. Reset at each record so a
+    # missing new field cannot silently inherit an older record's measurement.
+    value="$(awk -F, -v key="$metric_name" '
+      $1 == "task_id" || $1 == "num_proofs_input" { value = "" }
+      $1 == key { value = $2 }
+      END { if (value != "") print value }
+    ' "$csv_file")"
+    echo "${value:-$missing_value}"
   else
-    echo "0"
+    echo "$missing_value"
   fi
 }
 
@@ -53,9 +60,7 @@ add_decimal() {
   if command -v bc >/dev/null 2>&1; then
     echo "$left + $right" | bc
   else
-    left="${left%.*}"
-    right="${right%.*}"
-    echo $((left + right))
+    awk -v left="$left" -v right="$right" 'BEGIN { printf "%.9f\n", left + right }'
   fi
 }
 
@@ -68,8 +73,7 @@ average_decimal() {
   elif command -v bc >/dev/null 2>&1; then
     echo "scale=2; $total / $count" | bc
   else
-    total="${total%.*}"
-    echo $((total / count))
+    awk -v total="$total" -v count="$count" 'BEGIN { printf "%.2f\n", total / count }'
   fi
 }
 
@@ -172,8 +176,14 @@ generate_performance_summary() {
   local total_mpc_b_g2=0
   local total_mpc_c=0
   local total_mpc_reconstruction=0
+  local total_online_computation=0
+  local total_mpc_execution=0
+  local online_computation_samples=0
   local total_witness_generation=0
   local total_witness_sharing=0
+  local total_qap_sharing=0
+  local qap_sharing_samples=0
+  local timing_scope_version=""
   local total_proof_size=0
   local constraint_count=0
   local aggregation_total=0
@@ -184,6 +194,24 @@ generate_performance_summary() {
   for i in $(seq 0 $((NUM_TASKS - 1))); do
     local task_csv="$METRICS_DIR/task_${i}_metrics.csv"
     if [ -f "$task_csv" ]; then
+      local task_scope="$(get_metric_from_csv "$task_csv" "timing_scope_version" "1")"
+      if [ -n "$timing_scope_version" ] && [ "$task_scope" != "$timing_scope_version" ]; then
+        echo "Error: mixed timing scopes in $METRICS_DIR; keep old and new runs separate" >&2
+        return 1
+      fi
+      timing_scope_version="$task_scope"
+      if [ "$task_scope" = "2" ]; then
+        local qap_sharing="$(get_metric_from_csv "$task_csv" "qap_sharing_ms" "")"
+        if [ -z "$qap_sharing" ]; then
+          echo "Error: scope 2 task is missing qap_sharing_ms: $task_csv" >&2
+          return 1
+        fi
+        total_qap_sharing="$(add_decimal "$total_qap_sharing" "$qap_sharing")"
+        qap_sharing_samples=$((qap_sharing_samples + 1))
+      elif [ "$task_scope" != "1" ]; then
+        echo "Error: unsupported timing_scope_version=$task_scope: $task_csv" >&2
+        return 1
+      fi
       local client_time="$(get_metric_from_csv "$task_csv" "client_total_time_ms")"
       local mpc_preprocessing="$(get_metric_from_csv "$task_csv" "mpc_preprocessing_ms")"
       local mpc_total="$(get_metric_from_csv "$task_csv" "mpc_total_time_ms")"
@@ -196,6 +224,13 @@ generate_performance_summary() {
       local witness_generation="$(get_metric_from_csv "$task_csv" "witness_generation_ms")"
       local witness_sharing="$(get_metric_from_csv "$task_csv" "witness_secret_sharing_ms")"
       local proof_size="$(get_metric_from_csv "$task_csv" "proof_size_bytes")"
+      local online_computation="$(get_metric_from_csv "$task_csv" "online_computation_ms" "")"
+      local mpc_execution="$(get_metric_from_csv "$task_csv" "mpc_execution_ms" "")"
+      if [ -n "$online_computation" ] && [ -n "$mpc_execution" ]; then
+        total_online_computation="$(add_decimal "$total_online_computation" "$online_computation")"
+        total_mpc_execution="$(add_decimal "$total_mpc_execution" "$mpc_execution")"
+        online_computation_samples=$((online_computation_samples + 1))
+      fi
 
       total_client_time="$(add_decimal "$total_client_time" "$client_time")"
       total_mpc_preprocessing="$(add_decimal "$total_mpc_preprocessing" "$mpc_preprocessing")"
@@ -254,7 +289,34 @@ total_witness_sharing_time_ms,$total_witness_sharing
 total_individual_proof_size_bytes,$total_proof_size
 aggregation_total_ms,$aggregation_total
 aggregation_compression_ratio,$compression_ratio
+online_computation_samples,$online_computation_samples
+timing_scope_version,$timing_scope_version
+qap_sharing_samples,$qap_sharing_samples
 EOF
+  if [ "$qap_sharing_samples" -eq "$NUM_TASKS" ] && [ "$qap_sharing_samples" -gt 0 ]; then
+    cat >> "$summary_csv" <<EOF
+total_qap_sharing_ms,$total_qap_sharing
+avg_qap_sharing_ms,$(average_decimal "$total_qap_sharing" "$NUM_TASKS")
+EOF
+  else
+    printf 'total_qap_sharing_ms,\navg_qap_sharing_ms,\n' >> "$summary_csv"
+  fi
+  if [ "$online_computation_samples" -eq "$NUM_TASKS" ] && [ "$online_computation_samples" -gt 0 ]; then
+    cat >> "$summary_csv" <<EOF
+total_online_computation_ms,$total_online_computation
+avg_online_computation_ms,$(average_decimal "$total_online_computation" "$NUM_TASKS")
+total_mpc_execution_ms,$total_mpc_execution
+avg_mpc_execution_ms,$(average_decimal "$total_mpc_execution" "$NUM_TASKS")
+EOF
+  else
+    # Legacy/mixed batches have no complete measurement of this new scope.
+    cat >> "$summary_csv" <<EOF
+total_online_computation_ms,
+avg_online_computation_ms,
+total_mpc_execution_ms,
+avg_mpc_execution_ms,
+EOF
+  fi
 
   log_status "Performance summary saved to $summary_csv"
 }
@@ -305,12 +367,26 @@ generate_benchmark_csvs() {
   local aggregation_raw_csv="$METRICS_DIR/aggregation_raw.csv"
   local summary_csv="$METRICS_DIR/benchmark_summary.csv"
   local i
+  local timing_scope_version=""
 
-  echo "label,task_id,witness_file,expected_match,constraints,client_time_ms,witness_generation_ms,r1cs_to_qap_ms,witness_share_ms,client_share_serialization_ms,client_to_server_total_payload_bytes,client_to_server_max_share_payload_bytes,mpc_preprocessing_time_ms,mpc_total_time_ms,mpc_server_to_server_total_payload_bytes,mpc_server_to_server_max_sent_payload_bytes,mpc_server_to_server_max_received_payload_bytes,proof_size_bytes,commitment_size_bytes,public_inputs_payload_bytes,server_to_aggregator_cryptographic_payload_bytes,server_to_aggregator_json_artifact_bytes,process_peak_rss_bytes,setup_time_ms" > "$proof_raw_csv"
+  echo "label,task_id,witness_file,expected_match,constraints,client_time_ms,witness_generation_ms,r1cs_to_qap_ms,witness_share_ms,client_share_serialization_ms,client_to_server_total_payload_bytes,client_to_server_max_share_payload_bytes,mpc_preprocessing_time_ms,mpc_total_time_ms,mpc_server_to_server_total_payload_bytes,mpc_server_to_server_max_sent_payload_bytes,mpc_server_to_server_max_received_payload_bytes,proof_size_bytes,commitment_size_bytes,public_inputs_payload_bytes,server_to_aggregator_cryptographic_payload_bytes,server_to_aggregator_json_artifact_bytes,process_peak_rss_bytes,setup_time_ms,mpc_execution_ms,online_computation_ms,qap_sharing_ms,timing_scope_version" > "$proof_raw_csv"
   for i in $(seq 0 $((NUM_TASKS - 1))); do
     local task_csv="$METRICS_DIR/task_${i}_metrics.csv"
     if [ -f "$task_csv" ]; then
-      echo "$LABEL,$i,${WITNESS_FILES[$i]},$EXPECTED_MATCH,$(get_metric_from_csv "$task_csv" "constraint_count"),$(get_metric_from_csv "$task_csv" "client_total_time_ms"),$(get_metric_from_csv "$task_csv" "witness_generation_ms"),$(get_metric_from_csv "$task_csv" "r1cs_to_qap_ms"),$(get_metric_from_csv "$task_csv" "witness_secret_sharing_ms"),$(get_metric_from_csv "$task_csv" "client_share_serialization_ms"),$(get_metric_from_csv "$task_csv" "client_to_server_total_payload_bytes"),$(get_metric_from_csv "$task_csv" "client_to_server_max_share_payload_bytes"),$(get_metric_from_csv "$task_csv" "mpc_preprocessing_ms"),$(get_metric_from_csv "$task_csv" "mpc_total_time_ms"),$(get_metric_from_csv "$task_csv" "mpc_server_to_server_total_payload_bytes"),$(get_metric_from_csv "$task_csv" "mpc_server_to_server_max_sent_payload_bytes"),$(get_metric_from_csv "$task_csv" "mpc_server_to_server_max_received_payload_bytes"),$(get_metric_from_csv "$task_csv" "proof_size_bytes"),$(get_metric_from_csv "$task_csv" "commitment_size_bytes"),$(get_metric_from_csv "$task_csv" "public_inputs_payload_bytes"),$(get_metric_from_csv "$task_csv" "server_to_aggregator_cryptographic_payload_bytes"),$(get_metric_from_csv "$task_csv" "server_to_aggregator_json_artifact_bytes"),$(get_metric_from_csv "$task_csv" "process_peak_rss_bytes"),$(get_metric_from_csv "$task_csv" "circuit_building_ms")" >> "$proof_raw_csv"
+      local task_scope="$(get_metric_from_csv "$task_csv" "timing_scope_version" "1")"
+      if [ -n "$timing_scope_version" ] && [ "$task_scope" != "$timing_scope_version" ]; then
+        echo "Error: mixed timing scopes in $METRICS_DIR; keep old and new runs separate" >&2
+        return 1
+      fi
+      timing_scope_version="$task_scope"
+      if [ "$task_scope" = "2" ] && [ -z "$(get_metric_from_csv "$task_csv" "qap_sharing_ms" "")" ]; then
+        echo "Error: scope 2 task is missing qap_sharing_ms: $task_csv" >&2
+        return 1
+      elif [ "$task_scope" != "1" ] && [ "$task_scope" != "2" ]; then
+        echo "Error: unsupported timing_scope_version=$task_scope: $task_csv" >&2
+        return 1
+      fi
+      echo "$LABEL,$i,${WITNESS_FILES[$i]},$EXPECTED_MATCH,$(get_metric_from_csv "$task_csv" "constraint_count"),$(get_metric_from_csv "$task_csv" "client_total_time_ms"),$(get_metric_from_csv "$task_csv" "witness_generation_ms"),$(get_metric_from_csv "$task_csv" "r1cs_to_qap_ms"),$(get_metric_from_csv "$task_csv" "witness_secret_sharing_ms"),$(get_metric_from_csv "$task_csv" "client_share_serialization_ms"),$(get_metric_from_csv "$task_csv" "client_to_server_total_payload_bytes"),$(get_metric_from_csv "$task_csv" "client_to_server_max_share_payload_bytes"),$(get_metric_from_csv "$task_csv" "mpc_preprocessing_ms"),$(get_metric_from_csv "$task_csv" "mpc_total_time_ms"),$(get_metric_from_csv "$task_csv" "mpc_server_to_server_total_payload_bytes"),$(get_metric_from_csv "$task_csv" "mpc_server_to_server_max_sent_payload_bytes"),$(get_metric_from_csv "$task_csv" "mpc_server_to_server_max_received_payload_bytes"),$(get_metric_from_csv "$task_csv" "proof_size_bytes"),$(get_metric_from_csv "$task_csv" "commitment_size_bytes"),$(get_metric_from_csv "$task_csv" "public_inputs_payload_bytes"),$(get_metric_from_csv "$task_csv" "server_to_aggregator_cryptographic_payload_bytes"),$(get_metric_from_csv "$task_csv" "server_to_aggregator_json_artifact_bytes"),$(get_metric_from_csv "$task_csv" "process_peak_rss_bytes"),$(get_metric_from_csv "$task_csv" "circuit_building_ms"),$(get_metric_from_csv "$task_csv" "mpc_execution_ms" ""),$(get_metric_from_csv "$task_csv" "online_computation_ms" ""),$(get_metric_from_csv "$task_csv" "qap_sharing_ms" ""),$task_scope" >> "$proof_raw_csv"
     fi
   done
 
@@ -334,6 +410,8 @@ generate_benchmark_csvs() {
       commitment_size += $19
       if (proof_count == 1) setup_once = $24
       mpc_preprocessing += $13
+      timing_scope = $28
+      if ($28 == 2) { qap_samples += 1; qap += $27 }
     }
     END {
       if (proof_count == 0) proof_count = 1
@@ -347,8 +425,29 @@ generate_benchmark_csvs() {
       printf "avg_commitment_size_bytes,%.2f\n", commitment_size / proof_count >> summary
       printf "setup_time_ms,%.2f\n", setup_once >> summary
       printf "avg_mpc_preprocessing_time_ms,%.2f\n", mpc_preprocessing / proof_count >> summary
+      printf "timing_scope_version,%s\n", timing_scope >> summary
+      printf "qap_sharing_samples,%d\n", qap_samples >> summary
+      if (qap_samples == proof_count && qap_samples > 0) {
+        printf "avg_qap_sharing_ms,%.6f\n", qap / proof_count >> summary
+      } else {
+        printf "avg_qap_sharing_ms,\n" >> summary
+      }
     }
   ' label="$LABEL" expected="$EXPECTED_MATCH" summary="$summary_csv" "$proof_raw_csv"
+
+  awk -F, '
+    NR == 1 { next }
+    $25 != "" && $26 != "" { samples += 1; execution += $25; online += $26 }
+    END {
+      printf "online_computation_samples,%d\n", samples >> summary
+      if (samples == expected && samples > 0) {
+        printf "avg_mpc_execution_ms,%.6f\n", execution / samples >> summary
+        printf "avg_online_computation_ms,%.6f\n", online / samples >> summary
+      } else {
+        printf "avg_mpc_execution_ms,\navg_online_computation_ms,\n" >> summary
+      }
+    }
+  ' expected="$NUM_TASKS" summary="$summary_csv" "$proof_raw_csv"
 
   awk -F, '
     NR == 1 { next }
