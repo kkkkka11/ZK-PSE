@@ -35,7 +35,3 @@ parallel = ["std", "ark-ff/parallel", "ark-poly/parallel", "ark-groth16/parallel
 
 [lib]
 bench = false
-
-[[bench]]
-name = "bench_aggregation"
-harness = false
