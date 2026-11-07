@@ -10,7 +10,9 @@
   },
   "scripts": {
     "check": "cargo check --workspace",
+    "build": "cargo build --locked --release -p zk-regex-compiler --bin zk-regex --manifest-path regex/zk-regex-compiler-v2/Cargo.toml && cargo build --locked --release --example regex --example password_policy_arkworks_benchmark --bin aggregation_server --features parallel",
     "build:prover": "cargo build --release --example regex --features parallel && cargo build --release --bin aggregation_server",
+    "circuits": "npm run generate:circuits && npm run generate:circuits:noshare",
     "generate:circuits": "node regex/build_lookahead_circuits.js regex/password_policies_5.txt fixtures/password_policies_5_ascii --compile --shared-input true --dot ascii",
     "generate:circuits:noshare": "node regex/build_lookahead_circuits.js regex/password_policies_5.txt fixtures/password_policies_5_ascii_noshare --compile --shared-input false --gen-substrs --dot ascii"
   }

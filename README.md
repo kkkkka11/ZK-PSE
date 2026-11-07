@@ -61,17 +61,13 @@ Run the following commands from the repository root:
 
 ```bash
 npm ci
-cargo build --locked --release -p zk-regex-compiler --bin zk-regex \
-  --manifest-path regex/zk-regex-compiler-v2/Cargo.toml
-cargo build --locked --release --example regex \
-  --example password_policy_arkworks_benchmark --bin aggregation_server --features parallel
-npm run generate:circuits
-npm run generate:circuits:noshare
+npm run build
+npm run circuits
 ```
 
 Policies are defined in [`regex/password_policies_5.txt`](regex/password_policies_5.txt).
-The two generation commands produce the circuit sets used by G16-Enhanced
-and G16-Base, respectively. G16-Enhanced shares input checks across DFAs
+This generates the circuit sets used by G16-Enhanced and G16-Base.
+G16-Enhanced shares input checks across DFAs
 and omits substring/reveal helpers. G16-Base uses separate input checks
 and includes these helpers. Both configurations use the same policies
 and password commitment.
