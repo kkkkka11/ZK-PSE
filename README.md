@@ -14,9 +14,10 @@ produce a proof, and an aggregator combines multiple proofs for batch
 verification. The included policies cover character composition, length
 requirements, date-pattern filtering, and sequential-character restrictions.
 
-This repository contains the core implementation and the main experiment
-runners. The experiments simulate the MPC parties within one process on
-a single machine, with messages exchanged over local channels. Their
+This repository contains the core implementation, step-by-step commands,
+and a minimal runnable example. The experiments simulate the MPC parties
+within one process on a single machine, with messages exchanged over
+local channels. Their
 runtime and communication measurements characterize this local setup.
 The prototype has not been audited for production use.
 
@@ -45,7 +46,7 @@ The prototype has not been audited for production use.
 | [`mpc-net/`](mpc-net/) | Communication interfaces and local simulation support |
 | [`snarkpack/`](snarkpack/) | Proof aggregation and aggregate verification |
 | [`fixtures/`](fixtures/) | Sample password inputs and compiled circuits for library tests |
-| [`scripts/`](scripts/) | Two main experiment runners |
+| [`scripts/run_example.sh`](scripts/run_example.sh) | Minimal proving, aggregation, and verification example |
 
 ## Requirements
 
@@ -75,48 +76,95 @@ and omits substring/reveal helpers. G16-Base uses separate input checks
 and includes these helpers. Both configurations use the same policies
 and password commitment.
 
-## Run experiments
+## Run a small Groth16 benchmark
 
-### Single-prover Groth16 baselines
-
-Run G16-Base and G16-Enhanced for all five policies, with 64 inputs per
-scenario and five proof-generation repetitions per input:
+From the repository root, run G16-Base and G16-Enhanced for Regex 1,
+using one input per match/non-match scenario and one repetition:
 
 ```bash
-REPEATS=5 NUM_TASKS=64 RAYON_NUM_THREADS=12 SKIP_CIRCUIT_BUILD=1 \
-  bash scripts/run_g16_baselines.zsh
+RAYON_NUM_THREADS=12 ./target/release/examples/password_policy_arkworks_benchmark \
+  --variant all --regex-id 1 --max-tasks 1 --repeats 1 --setup-repeats 1 \
+  --out benchmark_results/regex1_example
 ```
 
-The benchmark records witness generation, proof generation, verification,
-and setup separately. Its total proving time adds witness generation
-and proof generation. Results are written to `benchmark_results/g16_baselines/`
-as `proof_raw.csv`, `setup_raw.csv`, and `summary.csv`.
+The program records witness generation, proof generation, verification,
+and setup separately. Total proving time adds witness generation and
+proof generation. Results are written as `proof_raw.csv`, `setup_raw.csv`,
+and `summary.csv` in the selected output directory. Use `--help` to see
+available options and `--regex-id` to select another policy.
 
-### ZK-PSE delegated proving and aggregation
+## Generate, aggregate, and verify proofs
 
-Run Regex 1--5 for match and non-match scenarios, with five rounds of
-64 sequential proofs per scenario. Each batch is then aggregated and
-verified:
+The following commands demonstrate Regex 1 with two matching inputs and
+16 simulated MPC parties. Run them after building the programs and
+generating the circuits above.
+
+### 1. Create a fresh working directory
+
+Start from the repository root. Each example uses a separate directory
+so its proof files and cached keys stay together.
 
 ```bash
-REGEX_IDS='1 2 3 4 5' REPEATS=5 NUM_TASKS=64 \
-  RAYON_NUM_THREADS=1 AGGREGATION_RAYON_NUM_THREADS=12 \
-  bash scripts/run_e2e_regex1_5.zsh experiments/review_run
+PROJECT_ROOT="$PWD"
+mkdir -p "$PROJECT_ROOT/experiments"
+RUN_DIR="$(mktemp -d "$PROJECT_ROOT/experiments/regex1_manual.XXXXXX")"
+mkdir -p "$RUN_DIR/logs/metrics" "$RUN_DIR/proof_data/agg"
+cd "$RUN_DIR"
 ```
 
-The default MPC configuration uses 16 simulated parties. The two thread
-settings control the Rayon pools used during proving and aggregation.
-Sample inputs are in [`fixtures/regex/`](fixtures/regex/), with 64 inputs
-in each of `witness-good/` and `witness-bad/`. Each input supplies a
-password and a salt through the `password` and `k` fields.
+### 2. Generate and verify two individual proofs
 
-The selected experiment directory contains proof files, per-task and
-aggregation metrics, logs, and `e2e_raw.csv` / `e2e_summary.csv` batch
-wall-clock measurements. Client preparation, offline preprocessing,
-and server online computation have separate timers. Online computation
-runs from input shares and offline materials being ready through
-construction of the complete proof. QAP evaluation and sharing are
-counted in client preparation.
+Run the prover once for each of the two inputs:
+
+```bash
+for task_id in 0 1; do
+  RAYON_NUM_THREADS=1 "$PROJECT_ROOT/target/release/examples/regex" \
+    0 "$task_id" "$PROJECT_ROOT/network-address/16" 2 2 32768 \
+    "$PROJECT_ROOT/fixtures/password_policies_5_ascii/regex_1/build/GeneratedRegex1.r1cs" \
+    "$PROJECT_ROOT/fixtures/regex/witness-good/party${task_id}.json" 1 16
+done
+```
+
+The arguments specify the task ID, MPC configuration, circuit, input,
+expected policy result (`1` for a match), and number of parties.
+Individual proof verification is performed by the prover program.
+Both proofs use the same circuit and cached proving/verification keys.
+Sample JSON inputs provide the password and salt through the `password`
+and `k` fields.
+
+### 3. Aggregate and verify the batch
+
+The final argument specifies the expected number of proof files:
+
+```bash
+RAYON_NUM_THREADS=12 "$PROJECT_ROOT/target/release/aggregation_server" \
+  ./proof_data ./proof_data/verification_key.bin 2
+cd "$PROJECT_ROOT"
+```
+
+The aggregator checks the individual proofs, combines them, and verifies
+the aggregate proof. Proofs and aggregate outputs are under
+`$RUN_DIR/proof_data/`; per-task and aggregation metrics are under
+`$RUN_DIR/logs/metrics/`. The two thread settings control the Rayon pools
+used during proving and aggregation.
+
+Client preparation, offline preprocessing, and server online computation
+have separate timers. Online computation runs from input shares and
+offline materials being ready through construction of the complete proof.
+QAP evaluation and sharing are counted in client preparation.
+
+### Minimal example shortcut
+
+From any working directory, invoke the example by its path. From the
+repository root:
+
+```bash
+bash scripts/run_example.sh
+```
+
+This performs the same two-proof workflow in a fresh directory and prints
+the location of its proof files, metrics, and logs. The example demonstrates
+the basic workflow; it does not automate the full paper evaluation.
 
 ## Library tests
 
