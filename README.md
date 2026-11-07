@@ -78,20 +78,14 @@ and password commitment.
 
 ## Run a small Groth16 benchmark
 
-From the repository root, run G16-Base and G16-Enhanced for Regex 1,
-using one input per match/non-match scenario and one repetition:
+Run both Groth16 configurations for Regex 1 with one input per scenario:
 
 ```bash
-RAYON_NUM_THREADS=12 ./target/release/examples/password_policy_arkworks_benchmark \
-  --variant all --regex-id 1 --max-tasks 1 --repeats 1 --setup-repeats 1 \
-  --out benchmark_results/regex1_example
+./target/release/examples/password_policy_arkworks_benchmark \
+  --regex-id 1 --max-tasks 1 --repeats 1
 ```
 
-The program records witness generation, proof generation, verification,
-and setup separately. Total proving time adds witness generation and
-proof generation. Results are written as `proof_raw.csv`, `setup_raw.csv`,
-and `summary.csv` in the selected output directory. Use `--help` to see
-available options and `--regex-id` to select another policy.
+Results are written to `benchmark_results/g16_baselines/`.
 
 ## Generate, aggregate, and verify proofs
 
