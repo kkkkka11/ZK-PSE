@@ -120,16 +120,11 @@ counted in client preparation.
 
 ## Library tests
 
-The compiled SHA256 circuit fixtures needed by the library tests are
-included in [`fixtures/sha256/`](fixtures/sha256/). Run the tests with:
+Run the library tests in release mode:
 
 ```bash
 cargo test --locked --release --workspace --lib --features parallel
 ```
-
-The tests use local communication ports. With the current toolchain,
-Wasmer 2.3.0 triggers an internal memory precondition check in debug
-mode; the release library suite has been validated with these fixtures.
 
 ## Acknowledgements
 
