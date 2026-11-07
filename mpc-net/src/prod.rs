@@ -520,53 +520,60 @@ mod test {
         expected_result: u32,
         n_peers: usize,
     ) {
+        let completed = std::sync::Arc::new(tokio::sync::Barrier::new(n_peers + 1));
         let sums = testnet
-            .simulate_network_round(move |net| async move {
-                let my_id = net.party_id();
-                if let Some(king_recv) = net
-                    .client_send_or_king_receive_serialized::<u32>(
-                        &my_id,
-                        MultiplexedStreamID::Zero,
-                        0,
-                    )
-                    .await
-                    .unwrap()
-                {
-                    assert_eq!(my_id, 0);
-                    // convert each bytes into a u32, and sum
-                    let mut sum = 0;
-                    for share in king_recv.shares {
-                        println!("King recv ID: {}", share);
-                        sum += share;
-                    }
-                    // now, send the sum to each of the clients
-                    let bytes = bincode2::serialize(&sum).unwrap();
-                    let send = (0..(n_peers + 1))
-                        .map(|_| bytes.clone().into())
-                        .collect::<Vec<Bytes>>();
-                    net.client_receive_or_king_send(
-                        Some(send),
-                        MultiplexedStreamID::Zero,
-                    )
-                    .await
-                    .unwrap();
-                    sum
-                } else {
-                    assert_ne!(my_id, 0);
-                    let bytes = net
-                        .client_receive_or_king_send(
-                            None,
+            .simulate_network_round(move |net| {
+                let completed = completed.clone();
+                async move {
+                    let my_id = net.party_id();
+                    let result = if let Some(king_recv) = net
+                        .client_send_or_king_receive_serialized::<u32>(
+                            &my_id,
+                            MultiplexedStreamID::Zero,
+                            0,
+                        )
+                        .await
+                        .unwrap()
+                    {
+                        assert_eq!(my_id, 0);
+                        // convert each bytes into a u32, and sum
+                        let mut sum = 0;
+                        for share in king_recv.shares {
+                            println!("King recv ID: {}", share);
+                            sum += share;
+                        }
+                        // now, send the sum to each of the clients
+                        let bytes = bincode2::serialize(&sum).unwrap();
+                        let send = (0..(n_peers + 1))
+                            .map(|_| bytes.clone().into())
+                            .collect::<Vec<Bytes>>();
+                        net.client_receive_or_king_send(
+                            Some(send),
                             MultiplexedStreamID::Zero,
                         )
                         .await
                         .unwrap();
-                    let sum: u32 = bincode2::deserialize(&bytes).unwrap();
-                    sum
+                        sum
+                    } else {
+                        assert_ne!(my_id, 0);
+                        let bytes = net
+                            .client_receive_or_king_send(
+                                None,
+                                MultiplexedStreamID::Zero,
+                            )
+                            .await
+                            .unwrap();
+                        let sum: u32 = bincode2::deserialize(&bytes).unwrap();
+                        sum
+                    };
+                    // Keep every connection alive until all nodes finish exchanging data.
+                    completed.wait().await;
+                    drop(net);
+                    result
                 }
             })
             .await;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
         // Assert all values are the same inside the sums vector
         assert!(sums.iter().all(|sum| *sum == expected_result));
     }
