@@ -1,52 +1,6 @@
 # ZK-PSE
 
-ZK-PSE is a research prototype for privacy-preserving password policy
-evaluation. It lets a password owner prove whether a private password
-satisfies a public policy without revealing the password. Policies are
-expressed as regular expressions and compiled into arithmetic circuits.
-Poseidon commitments bind the private password and salt to the public
-statement checked by the circuit.
-
-The implementation combines Groth16 proofs, MPC-based delegated proving,
-and SnarkPack proof aggregation. The client prepares the witness and
-related data and their secret shares. The proving parties jointly
-produce a proof, and an aggregator combines multiple proofs for batch
-verification. The included policies cover character composition, length
-requirements, date-pattern filtering, and sequential-character restrictions.
-
-This repository contains the core implementation, step-by-step commands,
-and a minimal runnable example. The experiments simulate the MPC parties
-within one process on a single machine, with messages exchanged over
-local channels. Their
-runtime and communication measurements characterize this local setup.
-The prototype has not been audited for production use.
-
-## Workflow
-
-1. **Compile a policy.** The regex generator constructs a Circom circuit
-   for policy evaluation and the Poseidon commitment check.
-2. **Prepare offline materials.** The implementation prepares reusable
-   CRS shares and fresh random shares and masks for proving.
-3. **Delegate proof generation.** The client generates the witness,
-   computes the required QAP evaluations, and prepares secret shares of
-   the witness-dependent data. The proving parties use these shares and
-   the offline materials to compute and reconstruct a Groth16 proof.
-4. **Aggregate and verify.** The aggregator combines a batch of proofs
-   into an aggregate proof, which is checked together with the public
-   statements.
-
-## Repository structure
-
-| Path | Contents |
-| --- | --- |
-| [`regex/`](regex/) | Five password policies, circuit generator, and patched zk-regex compiler |
-| [`groth16/`](groth16/) | Delegated proving, single-prover benchmarks, and aggregation executable |
-| [`secret-sharing/`](secret-sharing/) | Packed secret-sharing operations |
-| [`dist-primitives/`](dist-primitives/) | Distributed polynomial and multi-scalar multiplication operations |
-| [`mpc-net/`](mpc-net/) | Communication interfaces and local simulation support |
-| [`snarkpack/`](snarkpack/) | Proof aggregation and aggregate verification |
-| [`fixtures/`](fixtures/) | Sample password inputs and compiled circuits for library tests |
-| [`scripts/run_example.sh`](scripts/run_example.sh) | Minimal proving, aggregation, and verification example |
+This repository contains the implementation of ZK-PSE.
 
 ## Requirements
 
