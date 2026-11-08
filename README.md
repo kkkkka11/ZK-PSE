@@ -1,6 +1,8 @@
 # ZK-PSE
 
 This repository contains the implementation of ZK-PSE.
+It supports privacy-preserving evaluation of password policies expressed as regular expressions.
+The implementation combines MPC-based delegated Groth16 proving with proof aggregation for batch verification.
 
 ## Requirements
 
