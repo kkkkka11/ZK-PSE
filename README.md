@@ -4,6 +4,9 @@ This repository contains the implementation of ZK-PSE for privacy-preserving
 password policy evaluation. It combines regex circuits, MPC-based delegated
 Groth16 proving, and proof aggregation for batch verification.
 
+> This implementation is a research prototype and has not undergone a rigorous
+> security audit. It is not intended for production use.
+
 ## Requirements
 
 Linux, Node.js 18 with npm, Circom 2.1.5, and the Rust toolchain specified
